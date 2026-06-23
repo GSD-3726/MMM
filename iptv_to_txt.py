@@ -4,7 +4,7 @@ IPTV源爬取 → 全部IP频道列表TXT生成器 v3
 """
 from playwright.sync_api import sync_playwright, Page
 from playwright_stealth import Stealth
-from bs4 import BeautifulSoup
+#from bs4 import BeautifulSoup
 import re
 import time
 import sys
