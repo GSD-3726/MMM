@@ -14,13 +14,10 @@ CRAWL_PROVINCE = "山东"    # 山东/安徽/北京/四川/浙江/湖北/河南/
 PAGE_SIZE = 6              # 仅支持 3 / 6 / 10
 TOTAL_PAGES = 3
 OUTPUT_FILE = "iptv_channels.txt"
-# 请求间隔（秒），避免给网站造成过大压力
-DELAY_BETWEEN_PAGES = 3   # 翻页间隔
-DELAY_BETWEEN_IPS = 4     # IP详情页间隔
+DELAY_BETWEEN_PAGES = 3
+DELAY_BETWEEN_IPS = 4
 
 # ===================== udpxy 组播转单播 =====================
-# 填写你的 udpxy 服务器地址，如 "http://192.168.1.100:4022"
-# 留空 "" 则不转换，保留原始链接
 UDPXY_SERVER = ""
 # ========================================================
 
@@ -49,68 +46,141 @@ def classify_channel(name: str) -> str:
 
 
 def convert_multicast_url(url: str) -> str:
-    """
-    将组播URL通过udpxy转为单播可播放URL
-    支持格式：
-      http://网关IP:端口/rtp/组播IP:端口  →  http://udpxy/rtp/组播IP:端口
-      http://网关IP:端口/udp/组播IP:端口  →  http://udpxy/udp/组播IP:端口
-      rtp://组播IP:端口                   →  http://udpxy/rtp/组播IP:端口
-      udp://组播IP:端口                   →  http://udpxy/udp/组播IP:端口
-    """
     if not UDPXY_SERVER:
         return url
-
-    # 已经包含 /rtp/ 或 /udp/ 路径 → 替换网关部分
     match = re.search(r'(/[ru]tp/)([\d.]+:\d+)', url)
     if match:
-        proto_path = match.group(1)   # /rtp/ 或 /udp/
-        stream_addr = match.group(2)  # 组播IP:端口
         base = UDPXY_SERVER.rstrip('/')
-        return f"{base}{proto_path}{stream_addr}"
-
-    # rtp:// 或 udp:// 开头
+        return f"{base}{match.group(1)}{match.group(2)}"
     match = re.match(r'(rtp|udp)://([\d.]+:\d+)', url)
     if match:
-        proto = match.group(1)
-        stream_addr = match.group(2)
         base = UDPXY_SERVER.rstrip('/')
-        return f"{base}/{proto}/{stream_addr}"
-
-    # 非组播URL，原样返回
+        return f"{base}/{match.group(1)}/{match.group(2)}"
     return url
 
 
-# ────────────── 第一步：遍历列表页，收集全部IP ──────────────
+def safe_goto(page: Page, url: str, timeout: int = 30000) -> bool:
+    try:
+        page.goto(url, timeout=timeout, wait_until="domcontentloaded")
+        return True
+    except Exception as e:
+        print(f"   ⚠️ 页面加载超时: {e}")
+        return False
+
+
+# ────────────── 第一步：遍历列表页，逐个点击IP获取详情页URL ──────────────
 
 def collect_all_ips(page: Page) -> list[dict]:
-    """遍历列表页，收集所有IP条目（含详情页跳转参数）"""
+    """
+    每页加载后，逐个点击IP链接进入详情页，记录URL后 go_back 返回。
+    每次 go_back 后重新查询当前页的链接（避免 stale element）。
+    """
     all_ips = []
+
     for pg in range(1, TOTAL_PAGES + 1):
         url = f"{LIST_URL}?t={t_value}&province={province_value}&limit={PAGE_SIZE}&page={pg}"
-        print(f"📃 列表页 {pg}/{TOTAL_PAGES}: {url}")
-        page.goto(url, timeout=30000, wait_until="domcontentloaded")
-        page.wait_for_selector("table", timeout=15000)
+        print(f"\n📃 列表页 {pg}/{TOTAL_PAGES}: {url}")
+        if not safe_goto(page, url):
+            print(f"   ❌ 第{pg}页加载失败，跳过")
+            continue
+        try:
+            page.wait_for_selector("table", timeout=15000)
+        except Exception:
+            print(f"   ❌ 第{pg}页未找到表格，跳过")
+            continue
         page.wait_for_timeout(2000)
 
-        rows = page.query_selector_all("table tr")[1:]
-        if not rows:
-            print(f"   ⚠️ 第{pg}页无数据，停止翻页")
-            break
+        # 统计本页有效IP数量（通过JS获取，避免stale）
+        ip_count = page.evaluate("""
+            () => {
+                const rows = document.querySelectorAll('table tr');
+                let count = 0;
+                for (let i = 1; i < rows.length; i++) {
+                    const tds = rows[i].querySelectorAll('td');
+                    if (tds.length < 6) continue;
+                    const status = tds[5].innerText.trim();
+                    if (status === '暂时失效' || status === '失效') continue;
+                    const link = tds[0].querySelector('a');
+                    if (link) count++;
+                }
+                return count;
+            }
+        """)
+        print(f"   📋 本页 {ip_count} 个有效IP，逐个点击获取URL...")
 
-        for row in rows:
-            tds = row.query_selector_all("td")
-            if len(tds) < 6:
-                continue
-            ip_text = tds[0].inner_text().strip()
-            status = tds[5].inner_text().strip()
-            if status in ("暂时失效", "失效"):
-                print(f"   ⏭️ 跳过 {ip_text} (状态: {status})")
-                continue
-            link = tds[0].query_selector("a")
-            if link:
-                all_ips.append({"ip": ip_text, "element": link, "page": pg})
+        # 逐个点击：每次点第1个链接（因为点完go_back后页面刷新，索引重置）
+        processed = 0
+        while processed < ip_count:
+            # 用JS获取第 processed+1 个有效链接的IP文本
+            ip_text = page.evaluate("""
+                (skipIndex) => {
+                    const rows = document.querySelectorAll('table tr');
+                    let count = 0;
+                    for (let i = 1; i < rows.length; i++) {
+                        const tds = rows[i].querySelectorAll('td');
+                        if (tds.length < 6) continue;
+                        const status = tds[5].innerText.trim();
+                        if (status === '暂时失效' || status === '失效') continue;
+                        const link = tds[0].querySelector('a');
+                        if (link) {
+                            if (count === skipIndex) return tds[0].innerText.trim();
+                            count++;
+                        }
+                    }
+                    return null;
+                }
+            """, processed)
 
-        print(f"   ✅ 本页收集 {len(rows)} 个IP，累计 {len(all_ips)} 个")
+            if not ip_text:
+                break
+
+            # 点击第 processed+1 个有效链接
+            try:
+                page.evaluate("""
+                    (skipIndex) => {
+                        const rows = document.querySelectorAll('table tr');
+                        let count = 0;
+                        for (let i = 1; i < rows.length; i++) {
+                            const tds = rows[i].querySelectorAll('td');
+                            if (tds.length < 6) continue;
+                            const status = tds[5].innerText.trim();
+                            if (status === '暂时失效' || status === '失效') continue;
+                            const link = tds[0].querySelector('a');
+                            if (link) {
+                                if (count === skipIndex) { link.click(); return true; }
+                                count++;
+                            }
+                        }
+                        return false;
+                    }
+                """, processed)
+                page.wait_for_timeout(3000)
+                detail_url = page.url
+                print(f"   [{processed+1}/{ip_count}] ✅ {ip_text}")
+                all_ips.append({"ip": ip_text, "detail_url": detail_url, "page": pg})
+            except Exception as e:
+                print(f"   [{processed+1}/{ip_count}] ⚠️ {ip_text} 点击失败: {e}")
+
+            # 返回列表页
+            try:
+                page.go_back()
+                page.wait_for_timeout(2500)
+                page.wait_for_selector("table", timeout=10000)
+                page.wait_for_timeout(1000)
+            except Exception:
+                # 恢复：重新加载列表页
+                print(f"   ⚠️ 返回失败，重新加载列表页...")
+                safe_goto(page, url)
+                try:
+                    page.wait_for_selector("table", timeout=15000)
+                    page.wait_for_timeout(1500)
+                except Exception:
+                    print(f"   ❌ 列表页恢复失败，跳过本页剩余IP")
+                    break
+
+            processed += 1
+
+        print(f"   📊 第{pg}页完成，累计 {len(all_ips)} 个IP")
         if pg < TOTAL_PAGES:
             time.sleep(DELAY_BETWEEN_PAGES)
 
@@ -120,49 +190,29 @@ def collect_all_ips(page: Page) -> list[dict]:
 # ────────────── 第二步：逐个IP获取频道列表 ──────────────
 
 def fetch_channels_for_ip(page: Page, ip_info: dict, index: int, total: int) -> list[dict]:
-    """从列表页点击IP → 详情页 → 频道列表 → TXT下载，返回频道列表"""
     ip = ip_info["ip"]
+    detail_url = ip_info["detail_url"]
     print(f"\n{'─'*50}")
     print(f"🔍 [{index}/{total}] IP: {ip}")
 
-    # 回到列表页（因为需要从列表页点击进入详情页）
-    pg = ip_info["page"]
-    list_url = f"{LIST_URL}?t={t_value}&province={province_value}&limit={PAGE_SIZE}&page={pg}"
-    print(f"   📃 加载列表页 (第{pg}页)...")
-    page.goto(list_url, timeout=30000, wait_until="domcontentloaded")
-    page.wait_for_selector("table", timeout=15000)
-    page.wait_for_timeout(1500)
-
-    # 重新找到对应IP的链接并点击（按IP文本匹配）
-    rows = page.query_selector_all("table tr")[1:]
-    target_link = None
-    for row in rows:
-        tds = row.query_selector_all("td")
-        if len(tds) >= 1:
-            cell_text = tds[0].inner_text().strip()
-            if cell_text == ip:
-                target_link = tds[0].query_selector("a")
-                break
-
-    if not target_link:
-        print(f"   ❌ 未找到IP {ip} 的链接")
-        return []
-
-    # 点击进入详情页
     print(f"   📄 进入详情页...")
-    target_link.click()
-    page.wait_for_timeout(3000)
+    if not safe_goto(page, detail_url):
+        print(f"   ❌ 详情页加载失败")
+        return []
+    page.wait_for_timeout(2000)
 
-    # 点击"查看频道列表"
     ch_link = page.query_selector('a:has-text("查看频道列表")')
     if not ch_link:
         print(f"   ❌ 未找到频道列表入口")
         return []
     print(f"   📋 加载频道列表...")
-    ch_link.click()
-    page.wait_for_timeout(4000)
+    try:
+        ch_link.click()
+        page.wait_for_timeout(4000)
+    except Exception:
+        print(f"   ❌ 频道列表加载失败")
+        return []
 
-    # 通过TXT下载接口获取全部频道
     txt_link = page.query_selector('a:has-text("TXT下载")')
     if not txt_link:
         print(f"   ❌ 未找到TXT下载链接")
@@ -171,7 +221,11 @@ def fetch_channels_for_ip(page: Page, ip_info: dict, index: int, total: int) -> 
     href = txt_link.get_attribute("href")
     txt_url = f"{LIST_URL}{href}"
     print(f"   📥 下载频道数据...")
-    resp = page.request.get(txt_url)
+    try:
+        resp = page.request.get(txt_url)
+    except Exception:
+        print(f"   ❌ 下载请求失败")
+        return []
 
     if resp.status != 200:
         print(f"   ❌ TXT下载失败 (HTTP {resp.status})")
@@ -196,16 +250,11 @@ def fetch_channels_for_ip(page: Page, ip_info: dict, index: int, total: int) -> 
 # ────────────── 第三步：合并输出 ──────────────
 
 def format_txt(all_channels: dict[str, list[dict]]) -> str:
-    """
-    all_channels: {"央视频道": [...], "卫视频道": [...], "其他频道": [...]}
-    按分类输出，同类内按频道名排序
-    """
     lines = []
     for genre in ["央视频道", "卫视频道", "其他频道"]:
         items = all_channels.get(genre, [])
         if not items:
             continue
-        # 按频道名去重（保留顺序）
         seen = set()
         unique = []
         for ch in items:
@@ -253,7 +302,7 @@ def main():
         )
         page = ctx.new_page()
 
-        # 第一步：收集全部IP
+        # 第一步
         print("\n📋 第一步：收集IP列表")
         ip_list = collect_all_ips(page)
         print(f"\n📊 共收集 {len(ip_list)} 个有效IP\n")
@@ -263,7 +312,7 @@ def main():
             browser.close()
             return
 
-        # 第二步：逐个获取频道
+        # 第二步
         print("📥 第二步：逐个获取频道列表")
         all_groups = {"央视频道": [], "卫视频道": [], "其他频道": []}
         success_count = 0
@@ -275,14 +324,12 @@ def main():
                 for ch in channels:
                     cat = classify_channel(ch["name"])
                     all_groups[cat].append(ch)
-
-            # IP间延迟
             if i < len(ip_list):
                 time.sleep(DELAY_BETWEEN_IPS)
 
         browser.close()
 
-    # 第三步：合并输出
+    # 第三步
     total_channels = sum(len(v) for v in all_groups.values())
     print(f"\n{'=' * 60}")
     print(f"📊 统计: {success_count}/{len(ip_list)} 个IP成功，共 {total_channels} 个频道")
@@ -297,7 +344,6 @@ def main():
 
     print(f"💾 已保存到 {OUTPUT_FILE}")
 
-    # 打印摘要
     for genre in ["央视频道", "卫视频道", "其他频道"]:
         items = all_groups.get(genre, [])
         if items:
