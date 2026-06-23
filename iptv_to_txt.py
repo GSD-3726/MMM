@@ -1,10 +1,10 @@
 """
-IPTV源爬取 → 全部IP频道列表TXT生成器 v3
-优化：直接从onclick提取p值，从详情页HTML提取s值，无需点击
+IPTV源爬取 → 全部IP频道列表TXT生成器 v4
+优化：URL可直接拼接，用 requests 替代 Playwright，速度更快
 """
 from playwright.sync_api import sync_playwright, Page
 from playwright_stealth import Stealth
-#from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup
 import re
 import time
 import sys
@@ -12,11 +12,11 @@ import sys
 # ===================== 可自定义参数区 =====================
 CRAWL_TYPE = "酒店"        # 组播 / 酒店 / 咪咕 / 其他 / 全部
 CRAWL_PROVINCE = "山东"    # 山东/安徽/北京/四川/浙江/湖北/河南/江苏/广东/湖南/全部
-PAGE_SIZE = 10              # 仅支持 3 / 6 / 10
+PAGE_SIZE = 6              # 仅支持 3 / 6 / 10
 TOTAL_PAGES = 3
 OUTPUT_FILE = "iptv_channels.txt"
-DELAY_BETWEEN_PAGES = 3
-DELAY_BETWEEN_IPS = 3
+DELAY_BETWEEN_PAGES = 2
+DELAY_BETWEEN_IPS = 2
 
 # ===================== udpxy 组播转单播 =====================
 UDPXY_SERVER = ""
@@ -35,7 +35,6 @@ if PAGE_SIZE not in (3, 6, 10):
     PAGE_SIZE = 3
 t_value = type_map.get(CRAWL_TYPE, "all")
 province_value = province_map.get(CRAWL_PROVINCE, "all")
-
 
 def log(msg: str, end: str = "\n"):
     print(msg, flush=True, end=end)
@@ -64,6 +63,8 @@ def convert_multicast_url(url: str) -> str:
     return url
 
 
+# ────────────── 第一步：遍历列表页，提取所有 p 值 ──────────────
+
 def safe_goto(page: Page, url: str, timeout: int = 30000) -> bool:
     try:
         page.goto(url, timeout=timeout, wait_until="domcontentloaded")
@@ -73,12 +74,10 @@ def safe_goto(page: Page, url: str, timeout: int = 30000) -> bool:
         return False
 
 
-# ────────────── 第一步：遍历列表页，提取所有 p 值 ──────────────
-
 def collect_all_ips(page: Page) -> list[dict]:
     """
-    从列表页的 onclick 属性中直接提取 p 值，不需要点击。
-    格式: onclick="gotoIP('VFjCz2RqBoYaBgpo2umxXg', 'multicast')"
+    直接拼接URL访问列表页，从HTML中提取 p 值。
+    URL格式: index.php?t={type}&province={province}&limit={size}&page={n}
     """
     all_ips = []
     seen = set()
@@ -110,7 +109,6 @@ def collect_all_ips(page: Page) -> list[dict]:
                     if (!link) continue;
                     const ip = tds[0].innerText.trim();
                     const onclick = link.getAttribute('onclick') || '';
-                    // 提取 p 值: gotoIP('xxx', 'type')
                     const match = onclick.match(/gotoIP\\('([^']+)',\\s*'([^']+)'\\)/);
                     if (match) {
                         results.push({ip: ip, p: match[1], type: match[2]});
@@ -143,8 +141,9 @@ def collect_all_ips(page: Page) -> list[dict]:
 
 def fetch_channels_for_ip(page: Page, ip_info: dict, index: int, total: int) -> list[dict]:
     """
-    直接访问详情页 → 从HTML提取s值 → 拼接TXT下载URL → 下载
-    只需2次请求，不需要点击任何按钮。
+    直接拼接详情页URL → 提取s值 → 拼接TXT下载URL → 下载
+    URL格式: index.php?p={p}&t={type}  (详情页)
+             index.php?s={s}&t={type}&channels=1&download=txt  (下载)
     """
     ip = ip_info["ip"]
     p_val = ip_info["p"]
@@ -175,7 +174,7 @@ def fetch_channels_for_ip(page: Page, ip_info: dict, index: int, total: int) -> 
     """)
 
     if not s_val:
-        log(f"   ❌ 未找到s值（可能被广告劫持）")
+        log(f"   ❌ 未找到s值")
         return []
 
     log(f"   🔑 s={s_val}")
@@ -245,7 +244,7 @@ def format_txt(all_channels: dict[str, list[dict]]) -> str:
 
 def main():
     log("=" * 60)
-    log(f"🚀 IPTV频道爬取器 v3 (无点击模式)")
+    log(f"🚀 IPTV频道爬取器 v4 (Playwright浏览器模式)")
     log(f"   类型={CRAWL_TYPE} | 省份={CRAWL_PROVINCE}")
     log(f"   页数={TOTAL_PAGES} | 每页={PAGE_SIZE}条")
     log(f"   预计IP数: {TOTAL_PAGES * PAGE_SIZE}")
@@ -274,14 +273,14 @@ def main():
         page = ctx.new_page()
 
         # 第一步
-        log("\n📋 第一步：从列表页提取IP和p值（无需点击）")
+        log("\n📋 第一步：从列表页提取IP和p值")
         ip_list = collect_all_ips(page)
         log(f"\n📊 共提取 {len(ip_list)} 个有效IP\n")
 
         if not ip_list:
             log("❌ 没有找到有效IP，退出")
             browser.close()
-            return
+            sys.exit(1)
 
         # 第二步
         log("📥 第二步：逐个获取频道列表")
