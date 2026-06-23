@@ -11,12 +11,17 @@ import sys
 # ===================== 可自定义参数区 =====================
 CRAWL_TYPE = "酒店"        # 组播 / 酒店 / 咪咕 / 其他 / 全部
 CRAWL_PROVINCE = "山东"    # 山东/安徽/北京/四川/浙江/湖北/河南/江苏/广东/湖南/全部
-PAGE_SIZE = 10              # 仅支持 3 / 6 / 10
+PAGE_SIZE = 6              # 仅支持 3 / 6 / 10
 TOTAL_PAGES = 3
 OUTPUT_FILE = "iptv_channels.txt"
 # 请求间隔（秒），避免给网站造成过大压力
 DELAY_BETWEEN_PAGES = 3   # 翻页间隔
 DELAY_BETWEEN_IPS = 4     # IP详情页间隔
+
+# ===================== udpxy 组播转单播 =====================
+# 填写你的 udpxy 服务器地址，如 "http://192.168.1.100:4022"
+# 留空 "" 则不转换，保留原始链接
+UDPXY_SERVER = ""
 # ========================================================
 
 BASE_URL = "https://iptv.cqshushu.com"
@@ -43,6 +48,38 @@ def classify_channel(name: str) -> str:
     return "其他频道"
 
 
+def convert_multicast_url(url: str) -> str:
+    """
+    将组播URL通过udpxy转为单播可播放URL
+    支持格式：
+      http://网关IP:端口/rtp/组播IP:端口  →  http://udpxy/rtp/组播IP:端口
+      http://网关IP:端口/udp/组播IP:端口  →  http://udpxy/udp/组播IP:端口
+      rtp://组播IP:端口                   →  http://udpxy/rtp/组播IP:端口
+      udp://组播IP:端口                   →  http://udpxy/udp/组播IP:端口
+    """
+    if not UDPXY_SERVER:
+        return url
+
+    # 已经包含 /rtp/ 或 /udp/ 路径 → 替换网关部分
+    match = re.search(r'(/[ru]tp/)([\d.]+:\d+)', url)
+    if match:
+        proto_path = match.group(1)   # /rtp/ 或 /udp/
+        stream_addr = match.group(2)  # 组播IP:端口
+        base = UDPXY_SERVER.rstrip('/')
+        return f"{base}{proto_path}{stream_addr}"
+
+    # rtp:// 或 udp:// 开头
+    match = re.match(r'(rtp|udp)://([\d.]+:\d+)', url)
+    if match:
+        proto = match.group(1)
+        stream_addr = match.group(2)
+        base = UDPXY_SERVER.rstrip('/')
+        return f"{base}/{proto}/{stream_addr}"
+
+    # 非组播URL，原样返回
+    return url
+
+
 # ────────────── 第一步：遍历列表页，收集全部IP ──────────────
 
 def collect_all_ips(page: Page) -> list[dict]:
@@ -67,6 +104,7 @@ def collect_all_ips(page: Page) -> list[dict]:
             ip_text = tds[0].inner_text().strip()
             status = tds[5].inner_text().strip()
             if status in ("暂时失效", "失效"):
+                print(f"   ⏭️ 跳过 {ip_text} (状态: {status})")
                 continue
             link = tds[0].query_selector("a")
             if link:
@@ -90,6 +128,7 @@ def fetch_channels_for_ip(page: Page, ip_info: dict, index: int, total: int) -> 
     # 回到列表页（因为需要从列表页点击进入详情页）
     pg = ip_info["page"]
     list_url = f"{LIST_URL}?t={t_value}&province={province_value}&limit={PAGE_SIZE}&page={pg}"
+    print(f"   📃 加载列表页 (第{pg}页)...")
     page.goto(list_url, timeout=30000, wait_until="domcontentloaded")
     page.wait_for_selector("table", timeout=15000)
     page.wait_for_timeout(1500)
@@ -110,6 +149,7 @@ def fetch_channels_for_ip(page: Page, ip_info: dict, index: int, total: int) -> 
         return []
 
     # 点击进入详情页
+    print(f"   📄 进入详情页...")
     target_link.click()
     page.wait_for_timeout(3000)
 
@@ -118,6 +158,7 @@ def fetch_channels_for_ip(page: Page, ip_info: dict, index: int, total: int) -> 
     if not ch_link:
         print(f"   ❌ 未找到频道列表入口")
         return []
+    print(f"   📋 加载频道列表...")
     ch_link.click()
     page.wait_for_timeout(4000)
 
@@ -129,6 +170,7 @@ def fetch_channels_for_ip(page: Page, ip_info: dict, index: int, total: int) -> 
 
     href = txt_link.get_attribute("href")
     txt_url = f"{LIST_URL}{href}"
+    print(f"   📥 下载频道数据...")
     resp = page.request.get(txt_url)
 
     if resp.status != 200:
@@ -147,7 +189,7 @@ def fetch_channels_for_ip(page: Page, ip_info: dict, index: int, total: int) -> 
             if name and url and url.startswith("http"):
                 channels.append({"name": name, "url": url})
 
-    print(f"   ✅ 获取 {len(channels)} 个频道")
+    print(f"   ✅ 完成 [{index}/{total}] - {ip}: {len(channels)} 个频道")
     return channels
 
 
@@ -173,7 +215,8 @@ def format_txt(all_channels: dict[str, list[dict]]) -> str:
                 unique.append(ch)
         lines.append(f"{genre},#genre#")
         for ch in unique:
-            lines.append(f"{ch['name']},{ch['url']}")
+            final_url = convert_multicast_url(ch['url'])
+            lines.append(f"{ch['name']},{final_url}")
         lines.append("")
     return "\n".join(lines)
 
@@ -186,6 +229,10 @@ def main():
     print(f"   类型={CRAWL_TYPE} | 省份={CRAWL_PROVINCE}")
     print(f"   页数={TOTAL_PAGES} | 每页={PAGE_SIZE}条")
     print(f"   预计IP数: {TOTAL_PAGES * PAGE_SIZE}")
+    if UDPXY_SERVER:
+        print(f"   udpxy代理: {UDPXY_SERVER} (组播→单播)")
+    else:
+        print(f"   udpxy代理: 未配置 (保留原始链接)")
     print("=" * 60)
 
     stealth = Stealth(
