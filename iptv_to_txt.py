@@ -11,7 +11,7 @@ import sys
 # ===================== 可自定义参数区 =====================
 CRAWL_TYPE = "全部"        # 组播 / 酒店 / 咪咕 / 其他 / 全部
 CRAWL_PROVINCE = "山东"    # 山东/安徽/北京/四川/浙江/湖北/河南/江苏/广东/湖南/全部
-PAGE_SIZE = 6              # 仅支持 3 / 6 / 9
+PAGE_SIZE = 10              # 仅支持 3 / 6 / 10
 TOTAL_PAGES = 3
 OUTPUT_FILE = "iptv_channels.txt"
 # 请求间隔（秒），避免给网站造成过大压力
@@ -28,7 +28,7 @@ province_map = {
     "浙江": "zj", "湖北": "hb", "河南": "hn", "江苏": "js", "广东": "gd", "湖南": "hn",
 }
 
-if PAGE_SIZE not in (3, 6, 9):
+if PAGE_SIZE not in (3, 6, 10):
     PAGE_SIZE = 3
 t_value = type_map.get(CRAWL_TYPE, "all")
 province_value = province_map.get(CRAWL_PROVINCE, "all")
