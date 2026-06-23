@@ -1,0 +1,51 @@
+name: IPTV Channel Crawler
+
+on:
+  schedule:
+    # 北京时间 6:00 (UTC 22:00 前一天)
+    - cron: '0 22 * * *'
+    # 北京时间 18:00 (UTC 10:00)
+    - cron: '0 10 * * *'
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install playwright playwright-stealth
+          python -m playwright install --with-deps chromium
+
+      - name: Run IPTV crawler
+        run: python iptv_to_txt.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: iptv-channels
+          path: iptv_channels.txt
+          retention-days: 7
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add iptv_channels.txt
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            TIMESTAMP=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M')
+            git commit -m "🕐 Update IPTV channels (${TIMESTAMP} Beijing Time)"
+            git push
+          fi
