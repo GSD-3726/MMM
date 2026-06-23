@@ -12,8 +12,8 @@ import sys
 # ===================== 可自定义参数区 =====================
 CRAWL_TYPE = "酒店"        # 组播 / 酒店 / 咪咕 / 其他 / 全部
 CRAWL_PROVINCE = "山东"    # 山东/安徽/北京/四川/浙江/湖北/河南/江苏/广东/湖南/全部
-PAGE_SIZE = 6              # 仅支持 3 / 6 / 10
-TOTAL_PAGES = 3
+PAGE_SIZE = 10              # 仅支持 3 / 6 / 10
+TOTAL_PAGES = 4
 OUTPUT_FILE = "iptv_channels.txt"
 DELAY_BETWEEN_PAGES = 2
 DELAY_BETWEEN_IPS = 2
