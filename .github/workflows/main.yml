@@ -3,20 +3,27 @@ name: IPTV 直播源爬取
 on:
   workflow_dispatch:
     inputs:
+      pages:
+        description: '每频道取几页（每页约20条），0=不限制'
+        required: false
+        default: '1'
       max_links:
-        description: '每频道最多几条 (0=不限)'
+        description: '每频道最多几条，0=不限制'
         required: false
         default: '3'
 
   # 每天北京时间 6:00 和 17:00
   schedule:
-    - cron: '0 22 * * *'  # UTC 22:00 = 北京 6:00
-    - cron: '0 9 * * *'   # UTC 09:00 = 北京 17:00
+    - cron: '0 22 * * *'
+    - cron: '0 9 * * *'
 
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
+
+    permissions:
+      contents: write
 
     steps:
       - name: 检出代码
@@ -27,17 +34,28 @@ jobs:
 
       - name: 爬取直播源
         env:
+          PAGES: ${{ github.event.inputs.pages || '1' }}
           MAX_LINKS: ${{ github.event.inputs.max_links || '3' }}
         run: |
-          python3 main.py \
+          python3 -u main.py \
             -f demo.txt \
+            -p "$PAGES" \
             -n "$MAX_LINKS" \
             -o output
 
-      - name: 提交结果到仓库
+      - name: 提交并推送
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 添加输出文件
           git add output.txt output.m3u
-          git diff --staged --quiet || git commit -m "update iptv sources $(date +%Y-%m-%d)"
-          git push || true
+
+          # 检查是否有变更
+          if git diff --staged --quiet; then
+            echo "无变更，跳过提交"
+          else
+            git commit -m "auto update $(date '+%Y-%m-%d %H:%M')"
+            git push
+            echo "已推送到仓库"
+          fi
