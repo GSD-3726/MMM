@@ -39,10 +39,10 @@ BASE_URL = "https://iptv-search.com"
 CHANNEL_FILE = "demo.txt"
 
 # 每频道取几页搜索结果（每页约20条），0 = 不限制
-PAGES = 10
+PAGES = 1
 
 # 每频道最多保留几条流地址，0 = 不限制
-MAX_LINKS = 5
+MAX_LINKS = 3
 
 # 输出文件名前缀
 OUTPUT_NAME = "output"
@@ -105,7 +105,10 @@ def search_channels(keyword, limit=20):
             headers=HEADERS,
             timeout=15,
         )
-        resp.raise_for_status()
+        print(f"    API 状态: {resp.status_code}", flush=True)
+        if resp.status_code != 200:
+            print(f"    API 响应: {resp.text[:200]}", flush=True)
+            return []
         data = resp.json()
     except Exception as e:
         print(f"    搜索 API 错误: {e}", flush=True)
@@ -128,10 +131,14 @@ def get_channel_hash(channel_url):
     """访问频道页面，提取 CURRENT_CHANNEL_HASH。"""
     try:
         resp = requests.get(channel_url, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            print(f"    频道页状态: {resp.status_code}", flush=True)
+            return None
         m = re.search(r"CURRENT_CHANNEL_HASH\s*=\s*['\"]([^'\"]+)['\"]", resp.text)
         if m:
             return m.group(1)
+        else:
+            print(f"    频道页无 hash，HTML 长度: {len(resp.text)}", flush=True)
     except Exception as e:
         print(f"    获取 hash 错误: {e}", flush=True)
     return None
@@ -150,6 +157,7 @@ def get_stream_url(hash_val):
             timeout=15,
         )
         if resp.status_code != 200:
+            print(f"    play/link 状态: {resp.status_code} 响应: {resp.text[:100]}", flush=True)
             return None
         data = resp.json()
 
