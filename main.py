@@ -93,6 +93,49 @@ def parse_channel_file(filepath):
 
 # ─── API 调用 ──────────────────────────────────────────────────
 
+def normalize_name(name):
+    """
+    清洗频道名称，统一格式。
+    央视一台/央视一频道/央视1台/CCTV1/CCTV-1高清 → CCTV-1
+    """
+    if not name:
+        return name
+
+    name = name.strip()
+
+    # 中文数字 → 阿拉伯数字映射
+    cn_num = {
+        '一': '1', '二': '2', '三': '3', '四': '4', '五': '5',
+        '六': '6', '七': '7', '八': '8', '九': '9', '十': '10',
+        '十一': '11', '十二': '12', '十三': '13', '十四': '14',
+        '十五': '15', '十六': '16', '十七': '17',
+    }
+
+    # 央视X台/频道/频道 → CCTV-X
+    # 匹配: 央视一台, 央视1台, 央视一频道, 央视1频道, 央视一, 央视1
+    def cn_to_num(m):
+        num = m.group(1)
+        if num.isdigit():
+            return f'CCTV-{num}'
+        return f'CCTV-{cn_num.get(num, num)}'
+
+    name = re.sub(r'^央视(\d|[一二三四五六七八九十]+)[台频道]*$', cn_to_num, name)
+
+    # CCTV 后面的数字加横杠: CCTV1 → CCTV-1
+    name = re.sub(r'^CCTV(\d)', r'CCTV-\1', name, flags=re.IGNORECASE)
+
+    # CCTV-X频道 → CCTV-X
+    name = re.sub(r'^(CCTV-\d+)[频道]+$', r'\1', name)
+
+    # 去掉常见后缀（保留核心频道名）
+    for suffix in ['高清', '咪咕', '港澳版', '高码', '港澳', '标清', 'HD', 'hd']:
+        if name.endswith(suffix):
+            name = name[:-len(suffix)]
+            break
+
+    return name.strip()
+
+
 def search_channels(keyword, limit=20):
     """
     搜索频道，返回去重后的频道列表。
@@ -269,7 +312,7 @@ def search_single_channel(keyword, pages=1, max_links=0):
         if stream_url not in seen_urls:
             seen_urls.add(stream_url)
             results.append({
-                "name": ch["name"],
+                "name": normalize_name(ch["name"]),
                 "url": stream_url,
             })
             print(f"→ ✅", flush=True)
