@@ -1,61 +1,32 @@
 name: IPTV 直播源爬取
-
 on:
   workflow_dispatch:
-    inputs:
-      pages:
-        description: '每频道取几页（每页约20条），0=不限制'
-        required: false
-        default: '1'
-      max_links:
-        description: '每频道最多几条，0=不限制'
-        required: false
-        default: '3'
-
-  # 每天北京时间 6:00 和 17:00
   schedule:
-    - cron: '0 22 * * *'
-    - cron: '0 9 * * *'
-
+    - cron: '0 22 * * *'  # 北京时间次日 06:00
+    - cron: '0 10 * * *'  # 北京时间当天 18:00
 jobs:
   crawl:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-
     permissions:
       contents: write
-
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
-
-      - name: 安装 Python 依赖
-        run: pip install requests beautifulsoup4
-
-      - name: 爬取直播源
-        env:
-          PAGES: ${{ github.event.inputs.pages || '1' }}
-          MAX_LINKS: ${{ github.event.inputs.max_links || '3' }}
+      - name: 安装依赖
         run: |
-          python3 -u main.py \
-            -f demo.txt \
-            -p "$PAGES" \
-            -n "$MAX_LINKS" \
-            -o output
-
-      - name: 提交并推送
+          pip install requests beautifulsoup4
+          sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: 爬取 + 测速
+        run: python3 -u main.py
+      - name: 推送
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          # 添加输出文件
-          git add output.txt output.m3u
-
-          # 检查是否有变更
+          git add output/
           if git diff --staged --quiet; then
-            echo "无变更，跳过提交"
+            echo "无变更"
           else
-            git commit -m "auto update $(date '+%Y-%m-%d %H:%M')"
+            git commit -m "update $(date '+%Y-%m-%d %H:%M')"
             git push
-            echo "已推送到仓库"
           fi
