@@ -18,10 +18,10 @@ from collections import defaultdict
 #  ★ 配置区
 # ============================================================
 CHANNEL_FILE = "demo.txt"          # 频道列表文件路径
-PAGES = 2                          # 每频道抓取搜索结果页数
-MAX_LINKS = 10                     # 每频道最多提取直播源条数
+PAGES = 10                          # 每频道抓取搜索结果页数
+MAX_LINKS = 20                     # 每频道最多提取直播源条数
 TOP_N = 5                          # 测速后每频道保留最优源数量
-FFMPEG_TIMEOUT = 10                # ffmpeg测速超时时间（秒）
+FFMPEG_TIMEOUT = 20                # ffmpeg测速超时时间（秒）
 FFMPEG_DURATION = 3                # ffmpeg测速探测时长（秒）
 FFMPEG_CONCURRENCY = 3             # ffmpeg测速并发数
 OUTPUT_DIR = "output"              # 结果输出目录
