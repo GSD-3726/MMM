@@ -8,8 +8,14 @@ iptv-search.com 批量直播源爬虫
 用法:
   python3 main.py                          # 按 demo.txt 爬取
   python3 main.py -f demo.txt              # 指定频道文件
+  python3 main.py -p 2                     # 每频道取前2页结果
   python3 main.py -n 5                     # 每频道最多5条
   python3 main.py -k "CCTV-1"             # 只爬单个频道
+  python3 main.py -p 0 -n 0               # 不限制
+
+参数说明:
+  -p 页数    每频道取几页搜索结果（每页约20条），0=不限制（默认1）
+  -n 条数    每频道最多保留几条流地址，0=不限制（默认3）
 """
 
 import argparse
@@ -32,15 +38,18 @@ BASE_URL = "https://iptv-search.com"
 # 频道列表文件
 CHANNEL_FILE = "demo.txt"
 
-# 每个频道最多保留几条链接（0 = 不限制）
+# 每频道取几页搜索结果（每页约20条），0 = 不限制
+PAGES = 10
+
+# 每频道最多保留几条流地址，0 = 不限制
 MAX_LINKS = 5
 
 # 输出文件名前缀
 OUTPUT_NAME = "output"
 
-# 请求间隔（秒）—— 反爬
-DELAY_MIN = 1.0
-DELAY_MAX = 3.0
+# 请求间隔（秒）
+DELAY_MIN = 0.5
+DELAY_MAX = 1.5
 
 # HTTP 请求头
 HEADERS = {
@@ -51,8 +60,6 @@ HEADERS = {
 }
 
 # ============================================================
-
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def delay():
@@ -101,7 +108,7 @@ def search_channels(keyword, limit=20):
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
-        print(f"    搜索 API 错误: {e}")
+        print(f"    搜索 API 错误: {e}", flush=True)
         return []
 
     seen = set()
@@ -118,9 +125,7 @@ def search_channels(keyword, limit=20):
 
 
 def get_channel_hash(channel_url):
-    """
-    访问频道页面，提取 CURRENT_CHANNEL_HASH。
-    """
+    """访问频道页面，提取 CURRENT_CHANNEL_HASH。"""
     try:
         resp = requests.get(channel_url, headers=HEADERS, timeout=15)
         resp.raise_for_status()
@@ -128,7 +133,7 @@ def get_channel_hash(channel_url):
         if m:
             return m.group(1)
     except Exception as e:
-        print(f"    获取 hash 错误: {e}")
+        print(f"    获取 hash 错误: {e}", flush=True)
     return None
 
 
@@ -138,7 +143,6 @@ def get_stream_url(hash_val):
     调用 /api/play/link → 跟踪重定向 → 返回最终 m3u8 URL。
     """
     try:
-        # 获取 play link
         resp = requests.get(
             f"{BASE_URL}/api/play/link",
             params={"hash": hash_val},
@@ -152,7 +156,7 @@ def get_stream_url(hash_val):
         if not data.get("success") or not data.get("play_link"):
             return None
 
-        # 跟踪重定向获取真实流地址（不能带 Accept 头，否则 404）
+        # 不能带 Accept 头，否则 404
         resp = requests.get(
             data["play_link"],
             headers={"User-Agent": HEADERS["User-Agent"]},
@@ -161,46 +165,72 @@ def get_stream_url(hash_val):
         )
         content_type = resp.headers.get("content-type", "")
 
-        # 检查是否是 m3u8
         if "mpegurl" in content_type or resp.text.strip().startswith("#EXTM3U"):
             return resp.url
 
     except Exception as e:
-        print(f"    获取流地址错误: {e}")
+        print(f"    获取流地址错误: {e}", flush=True)
 
     return None
 
 
 # ─── 单频道爬取 ────────────────────────────────────────────────
 
-def search_single_channel(keyword, max_links=0):
+def search_single_channel(keyword, pages=1, max_links=0):
     """
     搜索单个频道，返回流地址列表。
-    [{"name": str, "url": str, "category": str}]
+
+    停止条件（满足任一即停）:
+      - 已获取的流地址数 >= max_links（max_links>0 时生效）
+      - 已处理的候选频道数 >= pages*20（pages>0 时生效）
+      - 两个都设为 0 则不限制
+
+    参数:
+      keyword:   频道名
+      pages:     取几页搜索结果（每页约20条），0=不限制
+      max_links: 最多返回几条流地址，0=不限制
     """
+    # 计算搜索数量上限
+    if pages <= 0:
+        search_limit = 100  # API 最大值
+    else:
+        search_limit = pages * 20
+
+    # 是否启用各限制
+    has_link_limit = max_links > 0
+    has_page_limit = pages > 0
+
+    # 搜索关键词预处理：API 不识别横杠，去掉后搜索
+    search_kw = keyword.replace("-", "").replace(" ", "")
+
     # 搜索频道
-    channels = search_channels(keyword, limit=20)
+    channels = search_channels(search_kw, limit=search_limit)
     if not channels:
         return []
 
-    # 精确匹配（优先 CCTV1 而不是 CCTV10）
-    # 构造灵活匹配模式
+    # 精确匹配
     escaped = re.escape(keyword)
     flexible = escaped.replace(r"\-", r"[-\s]?").replace(r"\ ", r"[-\s]?")
     pattern = re.compile(rf"^{flexible}(\s*综合)?$", re.IGNORECASE)
 
     exact = [ch for ch in channels if pattern.match(ch["name"])]
-    # 如果精确匹配有结果，用精确的；否则用全部
     candidates = exact if exact else channels
-
-    # 限制数量
-    if max_links > 0:
-        candidates = candidates[:max_links]
 
     results = []
     seen_urls = set()
+    checked = 0  # 已检查的候选频道数
 
     for ch in candidates:
+        # ── 停止条件1: 条数已满 ──
+        if has_link_limit and len(results) >= max_links:
+            break
+
+        # ── 停止条件2: 页数已满 ──
+        if has_page_limit and checked >= search_limit:
+            break
+
+        checked += 1
+
         # 获取 hash
         delay()
         hash_val = get_channel_hash(ch["url"])
@@ -234,7 +264,7 @@ def save_txt2tvlive(results, filename="output.txt"):
             for ch in group["channels"]:
                 f.write(f"{ch['name']},{ch['url']}\n")
             f.write("\n")
-    print(f"\n已保存: {filename}")
+    print(f"\n已保存: {filename}", flush=True)
 
 
 def save_m3u(results, filename="output.m3u"):
@@ -245,7 +275,7 @@ def save_m3u(results, filename="output.m3u"):
             for ch in group["channels"]:
                 f.write(f'#EXTINF:-1 group-title="{group["group"]}",{ch["name"]}\n')
                 f.write(f'{ch["url"]}\n')
-    print(f"已保存: {filename}")
+    print(f"已保存: {filename}", flush=True)
 
 
 # ─── 主流程 ────────────────────────────────────────────────────
@@ -254,15 +284,9 @@ def main():
     parser = argparse.ArgumentParser(
         description="iptv-search.com 批量直播源爬虫",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-示例:
-  python3 main.py                     # 按 demo.txt 爬取
-  python3 main.py -f my_channels.txt  # 指定频道文件
-  python3 main.py -n 3                # 每频道最多3条
-  python3 main.py -k "CCTV-1"        # 只爬单个频道
-        """,
     )
     parser.add_argument("-f", "--file", default=CHANNEL_FILE, help=f"频道列表文件 (默认: {CHANNEL_FILE})")
+    parser.add_argument("-p", "--pages", type=int, default=PAGES, help=f"每频道取几页结果,0不限 (默认: {PAGES})")
     parser.add_argument("-n", "--max-links", type=int, default=MAX_LINKS, help=f"每频道最多几条,0不限 (默认: {MAX_LINKS})")
     parser.add_argument("-k", "--keyword", default="", help="只爬单个频道")
     parser.add_argument("-o", "--output", default=OUTPUT_NAME, help=f"输出文件名前缀 (默认: {OUTPUT_NAME})")
@@ -273,16 +297,16 @@ def main():
         groups = [{"group": "自定义", "channels": [args.keyword]}]
     else:
         if not os.path.exists(args.file):
-            print(f"文件不存在: {args.file}")
+            print(f"文件不存在: {args.file}", flush=True)
             sys.exit(1)
         groups = parse_channel_file(args.file)
 
     total_channels = sum(len(g["channels"]) for g in groups)
-    print(f"数据源: {BASE_URL}")
-    print(f"频道文件: {args.file if not args.keyword else '单频道模式'}")
-    print(f"分组数: {len(groups)} | 频道总数: {total_channels}")
-    print(f"每频道: 最多 {args.max_links or '不限'} 条")
-    print("=" * 60)
+    print(f"数据源: {BASE_URL}", flush=True)
+    print(f"频道文件: {args.file if not args.keyword else '单频道模式'}", flush=True)
+    print(f"分组数: {len(groups)} | 频道总数: {total_channels}", flush=True)
+    print(f"配置: 每频道 {args.pages if args.pages > 0 else '不限'} 页 | 每频道最多 {args.max_links if args.max_links > 0 else '不限'} 条", flush=True)
+    print("=" * 60, flush=True)
 
     results = []
     channel_count = 0
@@ -292,37 +316,38 @@ def main():
 
         for keyword in group["channels"]:
             channel_count += 1
-            print(f"\n[{channel_count}/{total_channels}] 搜索: {keyword}")
+            print(f"\n[{channel_count}/{total_channels}] 搜索: {keyword}", flush=True)
 
             try:
-                items = search_single_channel(keyword, max_links=args.max_links)
+                items = search_single_channel(keyword, pages=args.pages, max_links=args.max_links)
             except Exception as e:
-                print(f"  ❌ 错误: {e}")
+                print(f"  ❌ 错误: {e}", flush=True)
                 items = []
 
             if items:
-                print(f"  ✅ 找到 {len(items)} 条")
+                print(f"  ✅ 找到 {len(items)} 条", flush=True)
                 for item in items:
+                    print(f"     {item['name']}: {item['url'][:80]}...", flush=True)
                     group_result["channels"].append({
                         "name": item["name"],
                         "url": item["url"],
                     })
             else:
-                print(f"  ⚠️  未找到结果")
+                print(f"  ⚠️  未找到结果", flush=True)
 
         if group_result["channels"]:
             results.append(group_result)
 
     # 统计
     total_links = sum(len(g["channels"]) for g in results)
-    print("\n" + "=" * 60)
-    print(f"爬取完成! {len(results)} 个分组, {total_links} 条链接")
+    print("\n" + "=" * 60, flush=True)
+    print(f"爬取完成! {len(results)} 个分组, {total_links} 条链接", flush=True)
 
     if total_links > 0:
         save_txt2tvlive(results, f"{args.output}.txt")
         save_m3u(results, f"{args.output}.m3u")
     else:
-        print("无结果可保存")
+        print("无结果可保存", flush=True)
 
 
 if __name__ == "__main__":
