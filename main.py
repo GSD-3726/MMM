@@ -150,7 +150,8 @@ def get_channel_hash(channel_url):
 
 def get_stream_url(hash_val):
     """
-    通过 hash 获取实际流媒体 URL。
+    通过 hash 获取流媒体 URL。
+    只跟踪 play_link 的 302 重定向拿 URL，不访问流服务器（避免 Cloudflare）。
     """
     try:
         # Step 1: 获取 play link
@@ -161,32 +162,29 @@ def get_stream_url(hash_val):
             timeout=15,
         )
         if resp.status_code != 200:
-            print(f"\n      play/link 状态: {resp.status_code} 响应: {resp.text[:100]}", flush=True)
             return None
         data = resp.json()
         if not data.get("success") or not data.get("play_link"):
-            print(f"\n      play/link 失败: {data}", flush=True)
             return None
 
-        play_link = data["play_link"]
-
-        # Step 2: 跟踪重定向获取真实流地址
+        # Step 2: 只跟踪 302 重定向，不访问流服务器
         resp = requests.get(
-            play_link,
+            data["play_link"],
             headers={"User-Agent": HEADERS["User-Agent"]},
-            allow_redirects=True,
+            allow_redirects=False,  # 不跟踪重定向
             timeout=15,
         )
-        content_type = resp.headers.get("content-type", "")
 
+        # 302 → Location 就是流地址
+        if resp.status_code in (301, 302, 303, 307, 308):
+            location = resp.headers.get("Location", "")
+            if location and location.startswith("http"):
+                return location
+
+        # 如果没有重定向，检查响应本身是否是 m3u8
+        content_type = resp.headers.get("content-type", "")
         if "mpegurl" in content_type or resp.text.strip().startswith("#EXTM3U"):
             return resp.url
-        else:
-            print(f"\n      play_link: {play_link}", flush=True)
-            print(f"      最终状态: {resp.status_code} 类型: {content_type}", flush=True)
-            print(f"      最终URL: {resp.url}", flush=True)
-            print(f"      响应前100字: {resp.text[:100]}", flush=True)
-            return None
 
     except Exception as e:
         print(f"\n      获取流地址异常: {e}", flush=True)
@@ -273,9 +271,8 @@ def search_single_channel(keyword, pages=1, max_links=0):
             results.append({
                 "name": ch["name"],
                 "url": stream_url,
-                "category": ch["category"],
             })
-            print(f"→ ✅ {stream_url[:50]}...", flush=True)
+            print(f"→ ✅", flush=True)
         else:
             print("→ 重复", flush=True)
 
