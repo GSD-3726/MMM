@@ -4,7 +4,6 @@ import re
 import sys
 import time
 import random
-import subprocess
 import shutil
 import requests
 
@@ -16,22 +15,16 @@ import requests
 CHANNEL_FILE = "demo.txt"
 
 # 每频道取几页搜索结果（每页约20条），0 = 不限制
-PAGES = 2
+PAGES = 1
 
 # 每频道最多爬几条，0 = 不限制
-MAX_LINKS = 20
-
-# 测速后每频道保留前 N 个，0 = 不测速（全部保留）
-TOP_N = 0
-
-# ffmpeg 测试超时（秒）
-FFMPEG_TIMEOUT = 10
-
-# ffmpeg 读取秒数
-FFMPEG_DURATION = 5
+MAX_LINKS = 1
 
 # 输出目录
 OUTPUT_DIR = "output"
+
+# 开启调试模式：失败时打印响应内容（定位问题用）
+DEBUG = True
 
 # ============================================================
 
@@ -46,15 +39,18 @@ UA_LIST = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
 ]
 
-DELAY_FAST = (0.3, 0.8)
-DELAY_SLOW = (0.8, 2.0)
+DELAY_FAST = (0.5, 1.2)
+DELAY_SLOW = (1.0, 2.5)
+
+# 全局会话：复用Cookie，提升通过率
+session = requests.Session()
 
 
 def get_ua():
     return random.choice(UA_LIST)
 
 
-def get_headers():
+def get_base_headers():
     return {
         "User-Agent": get_ua(),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -72,7 +68,7 @@ def delay_slow():
     time.sleep(random.uniform(*DELAY_SLOW))
 
 
-# ─── 频道文件 ─────────────────────────────────────────────────
+# ─── 频道文件解析 ─────────────────────────────────────────────────
 
 def parse_channel_file(filepath):
     groups = []
@@ -111,8 +107,6 @@ def normalize_name(name):
     name = re.sub(r'^CCTV(\d)', r'CCTV-\1', name, flags=re.IGNORECASE)
     name = re.sub(r'^(CCTV-\d+)[频道]+$', r'\1', name)
 
-    # 保留质量标记，去掉冗余后缀
-    # 高清/HD/1080p 等保留，咪咕/港澳版 等去掉
     for suffix in ['咪咕', '港澳版', '港澳', '高码', '高码率']:
         if name.endswith(suffix):
             name = name[:-len(suffix)]
@@ -121,67 +115,125 @@ def normalize_name(name):
     return name.strip()
 
 
-# ─── API ──────────────────────────────────────────────────────
+# ─── 核心爬取逻辑 ──────────────────────────────────────────────────────
 
 def search_channels(keyword, limit=20):
+    """搜索频道列表"""
+    headers = get_base_headers()
+    headers["Referer"] = f"{BASE_URL}/"
     try:
-        r = requests.get(f"{BASE_URL}/api/search",
+        r = session.get(
+            f"{BASE_URL}/api/search",
             params={"q": keyword, "limit": limit},
-            headers=get_headers(), timeout=15)
+            headers=headers,
+            timeout=15
+        )
         if r.status_code != 200:
+            if DEBUG:
+                print(f"\n[搜索接口异常] 状态码:{r.status_code} 前300字符:{r.text[:300]}")
             return []
         data = r.json()
-    except Exception:
+    except Exception as e:
+        if DEBUG:
+            print(f"\n[搜索接口报错] {str(e)}")
         return []
+
     seen, out = set(), []
-    for it in data.get("itemListElement", []):
+    # 兼容不同返回结构：优先取itemListElement，其次尝试常见的data/list
+    items = data.get("itemListElement", [])
+    if not items and isinstance(data.get("data"), list):
+        items = data["data"]
+    if not items and isinstance(data.get("list"), list):
+        items = data["list"]
+
+    for it in items:
         n, u = it.get("name",""), it.get("url","")
         if n and u and n not in seen:
+            # 补全相对路径
+            if u.startswith("/"):
+                u = BASE_URL + u
             seen.add(n)
             out.append({"name": n, "url": u})
     return out
 
 
 def get_hash(url):
+    """从详情页提取频道Hash"""
+    headers = get_base_headers()
+    headers["Referer"] = f"{BASE_URL}/"
     try:
-        r = requests.get(url, headers=get_headers(), timeout=15)
+        r = session.get(url, headers=headers, timeout=15)
         if r.status_code != 200:
+            if DEBUG:
+                print(f"\n[详情页异常] 状态码:{r.status_code}")
             return None
-        m = re.search(r"CURRENT_CHANNEL_HASH\s*=\s*['\"]([^'\"]+)['\"]", r.text)
-        return m.group(1) if m else None
-    except Exception:
-        return None
+        # 增强正则：兼容不同变量名、引号、空格
+        patterns = [
+            r"CURRENT_CHANNEL_HASH\s*=\s*['\"]([^'\"]+)['\"]",
+            r"channelHash\s*=\s*['\"]([^'\"]+)['\"]",
+            r"playHash\s*=\s*['\"]([^'\"]+)['\"]",
+            r'hash["\']?\s*:\s*["\']([^"\']+)["\']'
+        ]
+        for pat in patterns:
+            m = re.search(pat, r.text)
+            if m:
+                return m.group(1)
+        if DEBUG:
+            print(f"\n[Hash提取失败] 页面前500字符:{r.text[:500]}")
+    except Exception as e:
+        if DEBUG:
+            print(f"\n[详情页报错] {str(e)}")
+    return None
 
 
 def get_stream(hash_val):
-    ua = get_ua()
+    """通过Hash获取真实播放链接"""
+    headers = get_base_headers()
+    headers["Referer"] = f"{BASE_URL}/"
+    headers["Accept"] = "application/json, text/javascript, */*; q=0.01"
     try:
-        r = requests.get(f"{BASE_URL}/api/play/link",
+        r = session.get(
+            f"{BASE_URL}/api/play/link",
             params={"hash": hash_val},
-            headers={"User-Agent": ua}, timeout=15)
+            headers=headers,
+            timeout=15
+        )
         if r.status_code != 200:
+            if DEBUG:
+                print(f"\n[播放接口异常] 状态码:{r.status_code} 内容:{r.text[:300]}")
             return None
         d = r.json()
-        if not d.get("success") or not d.get("play_link"):
+
+        # 兼容不同返回结构
+        success = d.get("success", False) or d.get("code") == 0
+        play_link = d.get("play_link") or d.get("url") or d.get("data", {}).get("url")
+        if not success or not play_link:
+            if DEBUG:
+                print(f"\n[播放接口返回失败] {d}")
             return None
-        r = requests.get(d["play_link"],
-            headers={"User-Agent": ua},
-            allow_redirects=False, timeout=15)
-        if r.status_code in (301,302,303,307,308):
-            loc = r.headers.get("Location","")
-            if loc.startswith("http"):
-                return loc
+
+        # 跟随重定向获取真实地址
+        r = session.get(
+            play_link,
+            headers={"User-Agent": headers["User-Agent"]},
+            allow_redirects=True,
+            timeout=15
+        )
+        # 判断是否为有效m3u8
         ct = r.headers.get("content-type","")
         if "mpegurl" in ct or r.text.strip().startswith("#EXTM3U"):
             return r.url
-    except Exception:
-        pass
+        # 如果是重定向后的直链也返回
+        if r.url != play_link and r.status_code == 200:
+            return r.url
+    except Exception as e:
+        if DEBUG:
+            print(f"\n[播放接口报错] {str(e)}")
     return None
 
 
 # ─── 单频道爬取 ────────────────────────────────────────────────
 
-# 质量优先级（数字越大越优先）
 QUALITY_ORDER = {
     '4k': 10, '2160p': 10,
     '1080p': 9, '1080': 9, '高清': 9, 'hd': 9, 'fhd': 9,
@@ -192,13 +244,11 @@ QUALITY_ORDER = {
 
 
 def quality_score(name):
-    """根据频道名中的质量关键词打分，分数越高越优先。"""
     lower = name.lower()
     score = 0
     for kw, s in QUALITY_ORDER.items():
         if kw in lower:
             score = max(score, s)
-    # 「综合」通常是主频道，加一点分
     if '综合' in name:
         score += 1
     return score
@@ -220,7 +270,6 @@ def crawl_channel(keyword, pages=1, max_links=0):
     exact = [c for c in channels if pat.match(c["name"])]
     cands = exact if exact else channels
 
-    # 按质量排序（高分辨率优先）
     cands.sort(key=lambda c: quality_score(c["name"]), reverse=True)
 
     results, seen, checked = [], set(), 0
@@ -251,110 +300,9 @@ def crawl_channel(keyword, pages=1, max_links=0):
     return results
 
 
-# ─── ffmpeg 测速 ───────────────────────────────────────────────
-
-def test_stream(url, timeout=10, duration=5):
-    """
-    用 ffmpeg 测速，判断流是否稳定不卡。
-    返回 (是否可用, 响应时间秒, 原因)
-
-    判断逻辑:
-      1. ffmpeg 能读取 duration 秒且 returncode=0 → 稳定
-      2. 检查 stderr 中的卡顿指标:
-         - "buffer underflow" / "stall" → 卡顿
-         - "dropping frame" → 丢帧
-         - "Error decoding" → 解码错误
-      3. 计算实际下载字节数 vs 期望值（粗略判断是否够快）
-    """
-    # 根据协议调整参数
-    extra = []
-    if url.startswith("udp://") or url.startswith("rtp://"):
-        extra = ["-fifo_size", "1000000", "-overrun_nonfatal", "1"]
-    elif url.startswith("rtsp://"):
-        extra = ["-rtsp_transport", "tcp"]
-
-    cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "info",
-        "-rw_timeout", str(timeout * 1000000),
-        "-analyzeduration", "2000000",
-        "-probesize", "1000000",
-        *extra,
-        "-i", url,
-        "-t", str(duration),
-        "-f", "null", "-",
-    ]
-
-    try:
-        t0 = time.time()
-        r = subprocess.run(cmd, capture_output=True, timeout=timeout + duration + 5)
-        elapsed = time.time() - t0
-        stderr = r.stderr.decode("utf-8", errors="ignore")
-
-        # 检查卡顿指标
-        stall_words = ["buffer underflow", "stall", "dropping frame",
-                       "Error decoding", "Invalid data", "Connection timed out",
-                       "Server returned 4", "Server returned 5"]
-        for w in stall_words:
-            if w.lower() in stderr.lower():
-                return False, 0, w
-
-        if r.returncode == 0:
-            return True, elapsed, "ok"
-        else:
-            return False, 0, f"exit={r.returncode}"
-
-    except subprocess.TimeoutExpired:
-        return False, 0, "timeout"
-    except Exception as e:
-        return False, 0, str(e)
-
-
-def speed_filter(items, top_n=3):
-    """
-    测速，每频道保留稳定的前 top_n 个。
-    按响应时间排序（越快越稳定）。
-    """
-    if top_n <= 0:
-        return items
-
-    # 按频道名分组
-    by_name = {}
-    for item in items:
-        by_name.setdefault(item["name"], []).append(item)
-
-    print(f"\nffmpeg 测速 (每频道前{top_n})...", flush=True)
-    result = []
-    total_tested = 0
-    total_ok = 0
-
-    for name, ch_items in by_name.items():
-        stable = []
-        for i, item in enumerate(ch_items):
-            total_tested += 1
-            print(f"  {name} [{i+1}/{len(ch_items)}] ", end="", flush=True)
-            ok, t, reason = test_stream(
-                item["url"],
-                timeout=FFMPEG_TIMEOUT,
-                duration=FFMPEG_DURATION)
-            if ok:
-                stable.append(item)
-                total_ok += 1
-                print(f"✓ {t:.1f}s", flush=True)
-                if len(stable) >= top_n:
-                    break
-            else:
-                print(f"✗ {reason}", flush=True)
-
-        result.extend(stable)
-
-    print(f"测速完成: {total_ok}/{total_tested} 通过", flush=True)
-    return result
-
-
-# ─── 输出 ──────────────────────────────────────────────────────
+# ─── 输出保存 ──────────────────────────────────────────────────────
 
 def save_output(results, outdir):
-    # 清空输出目录
     if os.path.exists(outdir):
         shutil.rmtree(outdir)
     os.makedirs(outdir, exist_ok=True)
@@ -388,60 +336,46 @@ def main():
 
     groups = parse_channel_file(CHANNEL_FILE)
     total = sum(len(g["channels"]) for g in groups)
-    print(f"频道: {total} | 配置: {PAGES if PAGES>0 else '不限'}页/{MAX_LINKS if MAX_LINKS>0 else '不限'}条/{TOP_N if TOP_N>0 else '不测速'}测速", flush=True)
+    print(f"频道总数: {total} | 配置: {PAGES if PAGES>0 else '不限'}页 / {MAX_LINKS if MAX_LINKS>0 else '不限'}条 / 已关闭测速", flush=True)
 
-    # ── 爬取 ──
+    # 初始化会话：先访问首页拿Cookie
+    print("初始化会话...", flush=True)
+    try:
+        session.get(BASE_URL, headers=get_base_headers(), timeout=15)
+    except Exception as e:
+        print(f"首页访问失败: {e}", flush=True)
+
     results = []
     n = 0
     for g in groups:
         gr = {"group": g["group"], "channels": []}
         for kw in g["channels"]:
             n += 1
-            print(f"[{n}/{total}] {kw}", end=" ", flush=True)
+            print(f"\n[{n}/{total}] {kw}", end=" ", flush=True)
             try:
                 items = crawl_channel(kw, pages=PAGES, max_links=MAX_LINKS)
             except Exception as e:
                 print(f"❌ {e}", flush=True)
                 items = []
             if items:
-                print(f"✅ {len(items)}", flush=True)
+                print(f"✅ 成功获取 {len(items)} 条", flush=True)
                 gr["channels"].extend(items)
             else:
-                print("⚠️", flush=True)
+                print("⚠️ 无结果", flush=True)
         if gr["channels"]:
             results.append(gr)
 
     crawled = sum(len(g["channels"]) for g in results)
-    print(f"\n爬取: {len(results)}组 {crawled}条", flush=True)
+    print(f"\n爬取完成: {len(results)}组 共 {crawled} 条链接", flush=True)
 
     if crawled == 0:
-        print("无结果", flush=True)
+        print("未获取到任何有效链接，请开启DEBUG模式查看具体报错原因", flush=True)
         return
 
-    # ── 测速 ──
-    if TOP_N > 0:
-        all_ch = []
-        for g in results:
-            all_ch.extend(g["channels"])
-
-        stable = speed_filter(all_ch, top_n=TOP_N)
-        stable_urls = {ch["url"] for ch in stable}
-
-        new_results = []
-        for g in results:
-            filtered = [ch for ch in g["channels"] if ch["url"] in stable_urls]
-            if filtered:
-                new_results.append({"group": g["group"], "channels": filtered})
-        results = new_results
-
-        final = sum(len(g["channels"]) for g in results)
-        print(f"测速: 保留 {final} 条", flush=True)
-
-    # ── 输出 ──
     txt, m3u = save_output(results, OUTPUT_DIR)
-    print(f"\n已保存:", flush=True)
-    print(f"  {txt}", flush=True)
-    print(f"  {m3u}", flush=True)
+    print(f"\n结果已保存:", flush=True)
+    print(f"  TXT格式: {txt}", flush=True)
+    print(f"  M3U格式: {m3u}", flush=True)
 
 
 if __name__ == "__main__":
