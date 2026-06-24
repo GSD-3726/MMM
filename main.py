@@ -1,402 +1,435 @@
-import argparse
+#!/usr/bin/env python3
+"""
+iptv-search.com 批量直播源爬虫 + ffmpeg 异步并发测速 + 本地缓存
+================================================================
+流程: 爬取 → 读取缓存 → 并发测速(仅测未缓存) → 按码率保留前 N 个 → 输出
+"""
+
+import asyncio
 import json
 import os
 import re
 import sys
 import time
 import random
-
+import shutil
 import requests
+from collections import defaultdict
 
 # ============================================================
 #  ★ 配置区
 # ============================================================
 
-# 数据源网站
-BASE_URL = "https://iptv-search.com"
-
 # 频道列表文件
 CHANNEL_FILE = "demo.txt"
 
 # 每频道取几页搜索结果（每页约20条），0 = 不限制
-PAGES = 0
+PAGES = 1
 
-# 每频道最多保留几条流地址，0 = 不限制
-MAX_LINKS = 30
+# 每频道最多爬几条，0 = 不限制
+MAX_LINKS = 10
 
-# 输出文件名前缀
-OUTPUT_NAME = "output"
+# 测速后每频道保留前 N 个，0 = 不测速（全部保留）
+TOP_N = 5
 
-# 请求间隔（秒）
-DELAY_MIN = 0.5
-DELAY_MAX = 1.5
+# ffmpeg 测试超时（秒）
+FFMPEG_TIMEOUT = 10
 
-# HTTP 请求头
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-}
+# ffmpeg 读取秒数 (建议 5-8 秒)
+FFMPEG_DURATION = 6
+
+# 测速并发数 (GitHub Actions 建议 4-6，本地可 10+)
+FFMPEG_CONCURRENCY = 5
+
+# 输出目录
+OUTPUT_DIR = "output"
+
+# ─── 缓存配置 ────────────────────────────────────────────────
+ENABLE_CACHE = True          # 是否启用测速缓存
+CACHE_FILE = "speed_cache.json"
+CACHE_EXPIRE_HOURS = 72      # 缓存过期时间（小时）
 
 # ============================================================
 
+BASE_URL = "https://iptv-search.com"
 
-def delay():
-    """随机延迟。"""
-    time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+UA_LIST = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+]
 
+DELAY_FAST = (0.3, 0.8)
+DELAY_SLOW = (0.8, 2.0)
+
+def get_ua(): return random.choice(UA_LIST)
+
+def get_headers():
+    return {
+        "User-Agent": get_ua(),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+    }
+
+def delay_fast(): time.sleep(random.uniform(*DELAY_FAST))
+def delay_slow(): time.sleep(random.uniform(*DELAY_SLOW))
 
 # ─── 频道文件解析 ─────────────────────────────────────────────
-
 def parse_channel_file(filepath):
-    """解析频道列表文件，返回分组列表。"""
     groups = []
-    current_group = None
-
+    current = None
     with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if not line:
-                continue
+            if not line: continue
             if ",#genre#" in line.lower():
-                group_name = line.split(",")[0].strip()
-                group_name = re.sub(r'^[^\w]+', '', group_name).strip()
-                current_group = {"group": group_name, "channels": []}
-                groups.append(current_group)
-            elif current_group is not None:
-                if line:
-                    current_group["channels"].append(line)
-
+                name = line.split(",")[0].strip()
+                name = re.sub(r'^[^\w]+', '', name).strip()
+                current = {"group": name, "channels": []}
+                groups.append(current)
+            elif current and line:
+                current["channels"].append(line)
     return groups
 
-
-# ─── API 调用 ──────────────────────────────────────────────────
-
+# ─── 名称清洗 ─────────────────────────────────────────────────
 def normalize_name(name):
-    """
-    清洗频道名称，统一格式。
-    央视一台/央视一频道/央视1台/CCTV1/CCTV-1高清 → CCTV-1
-    """
-    if not name:
-        return name
-
+    if not name: return name
     name = name.strip()
-
-    # 中文数字 → 阿拉伯数字映射
-    cn_num = {
-        '一': '1', '二': '2', '三': '3', '四': '4', '五': '5',
-        '六': '6', '七': '7', '八': '8', '九': '9', '十': '10',
-        '十一': '11', '十二': '12', '十三': '13', '十四': '14',
-        '十五': '15', '十六': '16', '十七': '17',
-    }
-
-    # 央视X台/频道/频道 → CCTV-X
-    # 匹配: 央视一台, 央视1台, 央视一频道, 央视1频道, 央视一, 央视1
+    cn_num = {'一':'1','二':'2','三':'3','四':'4','五':'5','六':'6','七':'7','八':'8','九':'9','十':'10','十一':'11','十二':'12','十三':'13','十四':'14','十五':'15','十六':'16','十七':'17'}
     def cn_to_num(m):
         num = m.group(1)
-        if num.isdigit():
-            return f'CCTV-{num}'
-        return f'CCTV-{cn_num.get(num, num)}'
-
+        return f'CCTV-{num}' if num.isdigit() else f'CCTV-{cn_num.get(num, num)}'
     name = re.sub(r'^央视(\d|[一二三四五六七八九十]+)[台频道]*$', cn_to_num, name)
-
-    # CCTV 后面的数字加横杠: CCTV1 → CCTV-1
     name = re.sub(r'^CCTV(\d)', r'CCTV-\1', name, flags=re.IGNORECASE)
-
-    # CCTV-X频道 → CCTV-X
     name = re.sub(r'^(CCTV-\d+)[频道]+$', r'\1', name)
-
-    # 去掉常见后缀（保留核心频道名）
-    for suffix in ['高清', '咪咕', '港澳版', '高码', '港澳', '标清', 'HD', 'hd']:
+    for suffix in ['咪咕', '港澳版', '港澳', '高码', '高码率']:
         if name.endswith(suffix):
             name = name[:-len(suffix)]
             break
-
     return name.strip()
 
-
+# ─── API 爬取逻辑 (完全保留原版) ──────────────────────────────
 def search_channels(keyword, limit=20):
-    """
-    搜索频道，返回去重后的频道列表。
-    每项: {"name": str, "url": str, "category": str}
-    """
     try:
-        resp = requests.get(
-            f"{BASE_URL}/api/search",
-            params={"q": keyword, "limit": limit},
-            headers=HEADERS,
-            timeout=15,
-        )
-        print(f"    API 状态: {resp.status_code}", flush=True)
-        if resp.status_code != 200:
-            print(f"    API 响应: {resp.text[:200]}", flush=True)
-            return []
-        data = resp.json()
-    except Exception as e:
-        print(f"    搜索 API 错误: {e}", flush=True)
-        return []
+        r = requests.get(f"{BASE_URL}/api/search", params={"q": keyword, "limit": limit}, headers=get_headers(), timeout=15)
+        if r.status_code != 200: return []
+        data = r.json()
+    except Exception: return []
+    seen, out = set(), []
+    for it in data.get("itemListElement", []):
+        n, u = it.get("name",""), it.get("url","")
+        if n and u and n not in seen:
+            seen.add(n)
+            out.append({"name": n, "url": u})
+    return out
 
-    seen = set()
-    channels = []
-    for item in data.get("itemListElement", []):
-        name = item.get("name", "")
-        url = item.get("url", "")
-        category = item.get("description", "")
-        if name and url and name not in seen:
-            seen.add(name)
-            channels.append({"name": name, "url": url, "category": category})
-
-    print(f"    API 返回: {data.get('numberOfItems', 0)} 条, 去重: {len(channels)} 个", flush=True)
-    if channels:
-        print(f"    频道列表: {[c['name'] for c in channels[:5]]}", flush=True)
-
-    return channels
-
-
-def get_channel_hash(channel_url):
-    """访问频道页面，提取 CURRENT_CHANNEL_HASH。"""
+def get_hash(url):
     try:
-        resp = requests.get(channel_url, headers=HEADERS, timeout=15)
-        if resp.status_code != 200:
-            print(f"    频道页状态: {resp.status_code}", flush=True)
-            return None
-        m = re.search(r"CURRENT_CHANNEL_HASH\s*=\s*['\"]([^'\"]+)['\"]", resp.text)
-        if m:
-            return m.group(1)
-        else:
-            print(f"    频道页无 hash，HTML 长度: {len(resp.text)}", flush=True)
-    except Exception as e:
-        print(f"    获取 hash 错误: {e}", flush=True)
+        r = requests.get(url, headers=get_headers(), timeout=15)
+        if r.status_code != 200: return None
+        m = re.search(r"CURRENT_CHANNEL_HASH\s*=\s*['\"]([^'\"]+)['\"]", r.text)
+        return m.group(1) if m else None
+    except Exception: return None
+
+def get_stream(hash_val):
+    ua = get_ua()
+    try:
+        r = requests.get(f"{BASE_URL}/api/play/link", params={"hash": hash_val}, headers={"User-Agent": ua}, timeout=15)
+        if r.status_code != 200: return None
+        d = r.json()
+        if not d.get("success") or not d.get("play_link"): return None
+        r = requests.get(d["play_link"], headers={"User-Agent": ua}, allow_redirects=False, timeout=15)
+        if r.status_code in (301,302,303,307,308):
+            loc = r.headers.get("Location","")
+            if loc.startswith("http"): return loc
+        ct = r.headers.get("content-type","")
+        if "mpegurl" in ct or r.text.strip().startswith("#EXTM3U"): return r.url
+    except Exception: pass
     return None
 
+QUALITY_ORDER = {'4k': 10, '2160p': 10, '1080p': 9, '1080': 9, '高清': 9, 'hd': 9, 'fhd': 9, '720p': 8, '720': 8, '高码': 7, '高码率': 7, '480p': 5, '480': 5, '标清': 5, 'sd': 5}
 
-def get_stream_url(hash_val):
-    """
-    通过 hash 获取流媒体 URL。
-    只跟踪 play_link 的 302 重定向拿 URL，不访问流服务器（避免 Cloudflare）。
-    """
-    try:
-        # Step 1: 获取 play link
-        resp = requests.get(
-            f"{BASE_URL}/api/play/link",
-            params={"hash": hash_val},
-            headers=HEADERS,
-            timeout=15,
-        )
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        if not data.get("success") or not data.get("play_link"):
-            return None
+def quality_score(name):
+    lower = name.lower()
+    score = max((s for kw, s in QUALITY_ORDER.items() if kw in lower), default=0)
+    if '综合' in name: score += 1
+    return score
 
-        # Step 2: 只跟踪 302 重定向，不访问流服务器
-        resp = requests.get(
-            data["play_link"],
-            headers={"User-Agent": HEADERS["User-Agent"]},
-            allow_redirects=False,  # 不跟踪重定向
-            timeout=15,
-        )
+def crawl_channel(keyword, pages=1, max_links=0):
+    limit = 100 if pages <= 0 else pages * 20
+    has_link, has_page = max_links > 0, pages > 0
+    kw = keyword.replace("-","").replace(" ","")
+    channels = search_channels(kw, limit=limit)
+    if not channels: return []
 
-        # 302 → Location 就是流地址
-        if resp.status_code in (301, 302, 303, 307, 308):
-            location = resp.headers.get("Location", "")
-            if location and location.startswith("http"):
-                return location
-
-        # 如果没有重定向，检查响应本身是否是 m3u8
-        content_type = resp.headers.get("content-type", "")
-        if "mpegurl" in content_type or resp.text.strip().startswith("#EXTM3U"):
-            return resp.url
-
-    except Exception as e:
-        print(f"\n      获取流地址异常: {e}", flush=True)
-
-    return None
-
-
-# ─── 单频道爬取 ────────────────────────────────────────────────
-
-def search_single_channel(keyword, pages=1, max_links=0):
-    """
-    搜索单个频道，返回流地址列表。
-
-    停止条件（满足任一即停）:
-      - 已获取的流地址数 >= max_links（max_links>0 时生效）
-      - 已处理的候选频道数 >= pages*20（pages>0 时生效）
-      - 两个都设为 0 则不限制
-
-    参数:
-      keyword:   频道名
-      pages:     取几页搜索结果（每页约20条），0=不限制
-      max_links: 最多返回几条流地址，0=不限制
-    """
-    # 计算搜索数量上限
-    if pages <= 0:
-        search_limit = 100  # API 最大值
-    else:
-        search_limit = pages * 20
-
-    # 是否启用各限制
-    has_link_limit = max_links > 0
-    has_page_limit = pages > 0
-
-    # 搜索关键词预处理：API 不识别横杠，去掉后搜索
-    search_kw = keyword.replace("-", "").replace(" ", "")
-
-    # 搜索频道
-    channels = search_channels(search_kw, limit=search_limit)
-    if not channels:
-        return []
-
-    # 精确匹配
     escaped = re.escape(keyword)
-    flexible = escaped.replace(r"\-", r"[-\s]?").replace(r"\ ", r"[-\s]?")
-    pattern = re.compile(rf"^{flexible}(\s*综合)?$", re.IGNORECASE)
+    flex = escaped.replace(r"\-", r"[-\s]?").replace(r"\ ", r"[-\s]?")
+    pat = re.compile(rf"^{flex}(\s*综合)?$", re.IGNORECASE)
+    exact = [c for c in channels if pat.match(c["name"])]
+    cands = exact if exact else channels
+    cands.sort(key=lambda c: quality_score(c["name"]), reverse=True)
 
-    exact = [ch for ch in channels if pattern.match(ch["name"])]
-    candidates = exact if exact else channels
-
-    print(f"    精确匹配: {len(exact)} 个, 候选: {len(candidates)} 个", flush=True)
-
-    results = []
-    seen_urls = set()
-    checked = 0  # 已检查的候选频道数
-
-    for ch in candidates:
-        # ── 停止条件1: 条数已满 ──
-        if has_link_limit and len(results) >= max_links:
-            break
-
-        # ── 停止条件2: 页数已满 ──
-        if has_page_limit and checked >= search_limit:
-            break
-
+    results, seen, checked = [], set(), 0
+    for ch in cands:
+        if has_link and len(results) >= max_links: break
+        if has_page and checked >= limit: break
         checked += 1
         print(f"    [{checked}] {ch['name']}...", end=" ", flush=True)
-
-        # 获取 hash
-        delay()
-        hash_val = get_channel_hash(ch["url"])
-        if not hash_val:
-            print("→ 无 hash", flush=True)
-            continue
-
-        # 获取流地址
-        delay()
-        stream_url = get_stream_url(hash_val)
-        if not stream_url:
-            print("→ 无流地址", flush=True)
-            continue
-
-        if stream_url not in seen_urls:
-            seen_urls.add(stream_url)
-            results.append({
-                "name": normalize_name(ch["name"]),
-                "url": stream_url,
-            })
-            print(f"→ ✅", flush=True)
-        else:
-            print("→ 重复", flush=True)
-
+        delay_fast()
+        h = get_hash(ch["url"])
+        if not h: print("✗", flush=True); continue
+        delay_slow()
+        u = get_stream(h)
+        if not u: print("✗", flush=True); continue
+        if u not in seen:
+            seen.add(u)
+            results.append({"name": normalize_name(keyword), "url": u})
+            print("✓", flush=True)
+        else: print("=", flush=True)
     return results
 
+# ─── 缓存管理 (整合 import asy.txt 逻辑) ──────────────────────
+CACHE_EXPIRE_SECONDS = CACHE_EXPIRE_HOURS * 3600
 
-# ─── 输出保存 ──────────────────────────────────────────────────
+def load_cache():
+    if not ENABLE_CACHE or not os.path.exists(CACHE_FILE): return {}
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            cache = json.load(f)
+        now = time.time()
+        valid_cache = {url: data for url, data in cache.items() 
+                       if isinstance(data, dict) and (now - data.get("timestamp", 0)) < CACHE_EXPIRE_SECONDS}
+        print(f"📂 缓存加载完成，有效条目数: {len(valid_cache)}", flush=True)
+        return valid_cache
+    except Exception: return {}
 
-def save_txt2tvlive(results, filename="output.txt"):
-    """保存为 txt2tvlive 格式。"""
-    with open(filename, "w", encoding="utf-8") as f:
-        for group in results:
-            f.write(f"{group['group']},#genre#\n")
-            for ch in group["channels"]:
-                f.write(f"{ch['name']},{ch['url']}\n")
+def save_cache(cache):
+    if not ENABLE_CACHE: return
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"⚠️ 保存缓存失败: {e}", flush=True)
+
+# ─── ffmpeg 异步测速核心 (整合最优逻辑) ───────────────────────
+async def test_stream_async(url, timeout=10, duration=6):
+    """异步执行 ffmpeg，使用 -c copy 测真实码率"""
+    extra = []
+    if url.startswith("rtsp://"): extra = ["-rtsp_transport", "tcp"]
+    
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "info", "-stats_period", "0.5",
+        "-rw_timeout", str(timeout * 1000000),
+        "-analyzeduration", "3000000", "-probesize", "3000000",
+        *extra, "-i", url, "-t", str(duration),
+        "-c", "copy", "-f", "null", "-"
+    ]
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+        )
+        try:
+            _, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout + duration + 8)
+        except asyncio.TimeoutError:
+            proc.kill()
+            return False, 0, "timeout"
+            
+        stderr = stderr_bytes.decode("utf-8", errors="ignore")
+
+        # 致命错误检测 (只看前20行)
+        head_lines = "\n".join(stderr.split("\n")[:20])
+        for pat in [r"Connection refused", r"Connection timed out", r"Server returned 403", 
+                    r"Server returned 404", r"Server returned 5\d\d", r"Protocol not found"]:
+            if re.search(pat, head_lines, re.IGNORECASE):
+                return False, 0, pat
+
+        # 解析码率
+        bitrate = 0
+        bitrate_matches = re.findall(r"bitrate=\s*([\d.]+)\s*kbits/s", stderr)
+        if bitrate_matches:
+            bitrate = float(bitrate_matches[-1])
+            
+        if bitrate == 0:
+            size_match = re.search(r"L?size=\s*([\d]+)\s*kB", stderr)
+            time_match = re.search(r"time=(\d+):(\d+):(\d+\.\d+)", stderr)
+            if size_match and time_match:
+                size_kb = int(size_match.group(1))
+                h, m, s = time_match.groups()
+                media_sec = int(h) * 3600 + int(m) * 60 + float(s)
+                if media_sec > 0: bitrate = (size_kb * 8) / media_sec
+
+        frame_match = re.search(r"frame=\s*(\d+)", stderr)
+        frames = int(frame_match.group(1)) if frame_match else 0
+
+        if 0 < bitrate < 50:
+            return False, bitrate, f"bitrate too low ({bitrate:.0f}kbps)"
+
+        if (proc.returncode == 0 or frames > 10) and (bitrate > 0 or frames > 10):
+            return True, bitrate, f"{bitrate:.0f}kbps"
+        else:
+            return False, 0, f"exit={proc.returncode}"
+
+    except Exception as e:
+        return False, 0, str(e)
+
+async def speed_filter_async(items, top_n=3):
+    """并发测速 + 缓存机制 + 按码率排序"""
+    if top_n <= 0: return items
+
+    by_name = defaultdict(list)
+    for item in items: by_name[item["name"]].append(item)
+
+    cache = load_cache()
+    new_cache_updates = {}
+    
+    print(f"\n🚀 ffmpeg 异步测速 (并发:{FFMPEG_CONCURRENCY}, 每频道保留码率前{top_n})...", flush=True)
+    result = []
+    total_tested = 0
+    total_ok = 0
+
+    sem = asyncio.Semaphore(FFMPEG_CONCURRENCY)
+
+    async def test_one(item):
+        nonlocal total_tested, total_ok
+        url = item["url"]
+        
+        # 1. 检查缓存
+        if url in cache:
+            c_data = cache[url]
+            if c_data.get("ok"):
+                total_ok += 1
+                return {**item, "_bitrate": c_data.get("bitrate", 100), "_from_cache": True}
+            else:
+                return None # 缓存中是失败的，直接跳过
+
+        # 2. 缓存未命中，加锁测速
+        async with sem:
+            total_tested += 1
+            # 非致命错误重试 1 次
+            ok, bitrate, reason = await test_stream_async(url, FFMPEG_TIMEOUT, FFMPEG_DURATION)
+            if not ok and "timeout" not in reason and "403" not in reason and "404" not in reason:
+                await asyncio.sleep(1)
+                ok, bitrate, reason = await test_stream_async(url, FFMPEG_TIMEOUT, FFMPEG_DURATION)
+
+            # 3. 更新缓存字典
+            new_cache_updates[url] = {
+                "ok": ok, "bitrate": bitrate, "timestamp": time.time()
+            }
+
+            if ok:
+                total_ok += 1
+                return {**item, "_bitrate": bitrate, "_from_cache": False}
+            return None
+
+    for name, ch_items in by_name.items():
+        print(f"  频道组: {name}", flush=True)
+        
+        # 并发创建任务
+        tasks = [asyncio.create_task(test_one(it)) for it in ch_items]
+        tested = []
+        
+        for coro in asyncio.as_completed(tasks):
+            res = await coro
+            if res:
+                src = "(缓存)" if res.pop("_from_cache") else ""
+                print(f"    ✓ {res['url'][:40]}... {res['_bitrate']:.0f}kbps {src}", flush=True)
+                tested.append(res)
+            # 如果找到的稳定源已经足够，可以提前取消剩余任务 (优化)
+            if len(tested) >= top_n * 2: # 多测几个用来排序，但不需要全测
+                for t in tasks:
+                    if not t.done(): t.cancel()
+                break
+
+        # 按码率降序排列，取前 top_n
+        tested.sort(key=lambda x: x["_bitrate"], reverse=True)
+        stable = tested[:top_n]
+
+        if stable:
+            print(f"    → 保留 {len(stable)} 条 (码率: {stable[0]['_bitrate']:.0f} ~ {stable[-1]['_bitrate']:.0f} kbps)", flush=True)
+            for it in stable: it.pop("_bitrate", None)
+            result.extend(stable)
+
+    # 保存新缓存
+    if ENABLE_CACHE and new_cache_updates:
+        cache.update(new_cache_updates)
+        save_cache(cache)
+
+    print(f"\n测速完成: {total_ok} 个可用源 (含缓存复用)", flush=True)
+    return result
+
+# ─── 输出 ──────────────────────────────────────────────────────
+def save_output(results, outdir):
+    if os.path.exists(outdir): shutil.rmtree(outdir)
+    os.makedirs(outdir, exist_ok=True)
+    txt_path = os.path.join(outdir, "output.txt")
+    m3u_path = os.path.join(outdir, "output.m3u")
+    with open(txt_path, "w", encoding="utf-8") as f:
+        for g in results:
+            f.write(f"{g['group']},#genre#\n")
+            for ch in g["channels"]: f.write(f"{ch['name']},{ch['url']}\n")
             f.write("\n")
-    print(f"\n已保存: {filename}", flush=True)
-
-
-def save_m3u(results, filename="output.m3u"):
-    """保存为 m3u 格式。"""
-    with open(filename, "w", encoding="utf-8") as f:
+    with open(m3u_path, "w", encoding="utf-8") as f:
         f.write("#EXTM3U\n")
-        for group in results:
-            for ch in group["channels"]:
-                f.write(f'#EXTINF:-1 group-title="{group["group"]}",{ch["name"]}\n')
-                f.write(f'{ch["url"]}\n')
-    print(f"已保存: {filename}", flush=True)
-
+        for g in results:
+            for ch in g["channels"]:
+                f.write(f'#EXTINF:-1 group-title="{g["group"]}",{ch["name"]}\n{ch["url"]}\n')
+    return txt_path, m3u_path
 
 # ─── 主流程 ────────────────────────────────────────────────────
+async def main():
+    if not os.path.exists(CHANNEL_FILE):
+        print(f"文件不存在: {CHANNEL_FILE}", flush=True)
+        sys.exit(1)
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="iptv-search.com 批量直播源爬虫",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument("-f", "--file", default=CHANNEL_FILE, help=f"频道列表文件 (默认: {CHANNEL_FILE})")
-    parser.add_argument("-p", "--pages", type=int, default=PAGES, help=f"每频道取几页结果,0不限 (默认: {PAGES})")
-    parser.add_argument("-n", "--max-links", type=int, default=MAX_LINKS, help=f"每频道最多几条,0不限 (默认: {MAX_LINKS})")
-    parser.add_argument("-k", "--keyword", default="", help="只爬单个频道")
-    parser.add_argument("-o", "--output", default=OUTPUT_NAME, help=f"输出文件名前缀 (默认: {OUTPUT_NAME})")
-    args = parser.parse_args()
+    groups = parse_channel_file(CHANNEL_FILE)
+    total = sum(len(g["channels"]) for g in groups)
+    print(f"频道: {total} | 配置: {PAGES if PAGES>0 else '不限'}页 / {MAX_LINKS if MAX_LINKS>0 else '不限'}条 / 保留前{TOP_N} / 并发{FFMPEG_CONCURRENCY}", flush=True)
 
-    # 解析频道列表
-    if args.keyword:
-        groups = [{"group": "自定义", "channels": [args.keyword]}]
-    else:
-        if not os.path.exists(args.file):
-            print(f"文件不存在: {args.file}", flush=True)
-            sys.exit(1)
-        groups = parse_channel_file(args.file)
-
-    total_channels = sum(len(g["channels"]) for g in groups)
-    print(f"数据源: {BASE_URL}", flush=True)
-    print(f"频道文件: {args.file if not args.keyword else '单频道模式'}", flush=True)
-    print(f"分组数: {len(groups)} | 频道总数: {total_channels}", flush=True)
-    print(f"配置: 每频道 {args.pages if args.pages > 0 else '不限'} 页 | 每频道最多 {args.max_links if args.max_links > 0 else '不限'} 条", flush=True)
-    print("=" * 60, flush=True)
-
+    # ── 爬取 ──
     results = []
-    channel_count = 0
-
-    for group in groups:
-        group_result = {"group": group["group"], "channels": []}
-
-        for keyword in group["channels"]:
-            channel_count += 1
-            print(f"\n[{channel_count}/{total_channels}] 搜索: {keyword}", flush=True)
-
+    n = 0
+    for g in groups:
+        gr = {"group": g["group"], "channels": []}
+        for kw in g["channels"]:
+            n += 1
+            print(f"[{n}/{total}] {kw}", end=" ", flush=True)
             try:
-                items = search_single_channel(keyword, pages=args.pages, max_links=args.max_links)
+                items = crawl_channel(kw, pages=PAGES, max_links=MAX_LINKS)
             except Exception as e:
-                print(f"  ❌ 错误: {e}", flush=True)
+                print(f"❌ {e}", flush=True)
                 items = []
-
             if items:
-                print(f"  ✅ 找到 {len(items)} 条", flush=True)
-                for item in items:
-                    print(f"     {item['name']}: {item['url'][:80]}...", flush=True)
-                    group_result["channels"].append({
-                        "name": item["name"],
-                        "url": item["url"],
-                    })
+                print(f"✅ {len(items)}", flush=True)
+                gr["channels"].extend(items)
             else:
-                print(f"  ⚠️  未找到结果", flush=True)
+                print("⚠️", flush=True)
+        if gr["channels"]: results.append(gr)
 
-        if group_result["channels"]:
-            results.append(group_result)
+    crawled = sum(len(g["channels"]) for g in results)
+    print(f"\n爬取: {len(results)}组 {crawled}条", flush=True)
+    if crawled == 0: return
 
-    # 统计
-    total_links = sum(len(g["channels"]) for g in results)
-    print("\n" + "=" * 60, flush=True)
-    print(f"爬取完成! {len(results)} 个分组, {total_links} 条链接", flush=True)
+    # ── 异步测速 ──
+    if TOP_N > 0:
+        all_ch = [ch for g in results for ch in g["channels"]]
+        stable = await speed_filter_async(all_ch, top_n=TOP_N)
+        stable_urls = {ch["url"] for ch in stable}
+        results = [{"group": g["group"], "channels": [ch for ch in g["channels"] if ch["url"] in stable_urls]} 
+                   for g in results if any(ch["url"] in stable_urls for ch in g["channels"])]
+        print(f"测速后保留: {sum(len(g['channels']) for g in results)} 条", flush=True)
 
-    if total_links > 0:
-        save_txt2tvlive(results, f"{args.output}.txt")
-        save_m3u(results, f"{args.output}.m3u")
-    else:
-        print("无结果可保存", flush=True)
-
+    # ── 输出 ──
+    txt, m3u = save_output(results, OUTPUT_DIR)
+    print(f"\n已保存:\n  {txt}\n  {m3u}", flush=True)
 
 if __name__ == "__main__":
-    main()
+    # 兼容 Windows 和 Linux 的 asyncio 事件循环
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    asyncio.run(main())
