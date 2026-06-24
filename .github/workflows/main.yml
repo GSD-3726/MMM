@@ -1,54 +1,67 @@
-name: IPTV Channel Crawler
+name: IPTV 直播源爬取
 
 on:
-  schedule:
-    - cron: '0 22 * * *'
-    - cron: '0 10 * * *'
+  # 手动触发
   workflow_dispatch:
+    inputs:
+      pages:
+        description: '每频道爬几页'
+        required: false
+        default: '1'
+      max_links:
+        description: '每频道最多几条 (0=不限)'
+        required: false
+        default: '3'
 
-permissions:
-  contents: write
+  # 每天北京时间 6:00 和 17:00 自动运行
+  schedule:
+    - cron: '0 22 * * *'  # UTC 22:00 = 北京 6:00
+    - cron: '0 9 * * *'   # UTC 09:00 = 北京 17:00
 
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      PYTHONUNBUFFERED: 1
+    timeout-minutes: 120
 
     steps:
-      - name: Checkout repository
+      - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
         with:
-          python-version: '3.12'
+          node-version: '20'
 
-      - name: Install dependencies
+      - name: 安装 agent-browser
+        run: npm install -g agent-browser
+
+      - name: 安装 Python 依赖
+        run: pip install beautifulsoup4
+
+      - name: 爬取直播源
+        env:
+          PAGES: ${{ github.event.inputs.pages || '1' }}
+          MAX_LINKS: ${{ github.event.inputs.max_links || '3' }}
         run: |
-          pip install playwright playwright-stealth
-          python -m playwright install --with-deps chromium
+          python3 main.py \
+            -f demo.txt \
+            -p "$PAGES" \
+            -n "$MAX_LINKS" \
+            -o output
 
-      - name: Run IPTV crawler
-        run: python iptv_to_txt.py
-
-      - name: Upload artifact
+      - name: 上传结果
         uses: actions/upload-artifact@v4
         with:
-          name: iptv-channels
-          path: iptv_channels.txt
+          name: iptv-result
+          path: |
+            output.txt
+            output.m3u
           retention-days: 7
 
-      - name: Commit and push if changed
+      - name: 提交结果到仓库
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add iptv_channels.txt
-          if git diff --cached --quiet; then
-            echo "No changes to commit"
-          else
-            TIMESTAMP=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M')
-            git commit -m "🕐 Update IPTV channels (${TIMESTAMP} Beijing Time)"
-            git push
-          fi
+          git add output.txt output.m3u
+          git diff --staged --quiet || git commit -m "update iptv sources $(date +%Y-%m-%d)"
+          git push || true
