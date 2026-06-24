@@ -244,17 +244,20 @@ def search_single_channel(keyword, pages=1, max_links=0):
             break
 
         checked += 1
+        print(f"    [{checked}] {ch['name']}...", end=" ", flush=True)
 
         # 获取 hash
         delay()
         hash_val = get_channel_hash(ch["url"])
         if not hash_val:
+            print("→ 无 hash", flush=True)
             continue
 
         # 获取流地址
         delay()
         stream_url = get_stream_url(hash_val)
         if not stream_url:
+            print("→ 无流地址", flush=True)
             continue
 
         if stream_url not in seen_urls:
@@ -264,6 +267,9 @@ def search_single_channel(keyword, pages=1, max_links=0):
                 "url": stream_url,
                 "category": ch["category"],
             })
+            print(f"→ ✅ {stream_url[:50]}...", flush=True)
+        else:
+            print("→ 重复", flush=True)
 
     return results
 
