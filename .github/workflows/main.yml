@@ -1,7 +1,7 @@
 name: IPTV 直播源爬取
 on:
   workflow_dispatch:
-  schedule:
+  #schedule:
     - cron: '0 22 * * *'  # 北京时间次日 06:00
     - cron: '0 10 * * *'  # 北京时间当天 18:00
 jobs:
