@@ -151,9 +151,9 @@ def get_channel_hash(channel_url):
 def get_stream_url(hash_val):
     """
     通过 hash 获取实际流媒体 URL。
-    调用 /api/play/link → 跟踪重定向 → 返回最终 m3u8 URL。
     """
     try:
+        # Step 1: 获取 play link
         resp = requests.get(
             f"{BASE_URL}/api/play/link",
             params={"hash": hash_val},
@@ -161,16 +161,18 @@ def get_stream_url(hash_val):
             timeout=15,
         )
         if resp.status_code != 200:
-            print(f"    play/link 状态: {resp.status_code} 响应: {resp.text[:100]}", flush=True)
+            print(f"\n      play/link 状态: {resp.status_code} 响应: {resp.text[:100]}", flush=True)
             return None
         data = resp.json()
-
         if not data.get("success") or not data.get("play_link"):
+            print(f"\n      play/link 失败: {data}", flush=True)
             return None
 
-        # 不能带 Accept 头，否则 404
+        play_link = data["play_link"]
+
+        # Step 2: 跟踪重定向获取真实流地址
         resp = requests.get(
-            data["play_link"],
+            play_link,
             headers={"User-Agent": HEADERS["User-Agent"]},
             allow_redirects=True,
             timeout=15,
@@ -179,9 +181,15 @@ def get_stream_url(hash_val):
 
         if "mpegurl" in content_type or resp.text.strip().startswith("#EXTM3U"):
             return resp.url
+        else:
+            print(f"\n      play_link: {play_link}", flush=True)
+            print(f"      最终状态: {resp.status_code} 类型: {content_type}", flush=True)
+            print(f"      最终URL: {resp.url}", flush=True)
+            print(f"      响应前100字: {resp.text[:100]}", flush=True)
+            return None
 
     except Exception as e:
-        print(f"    获取流地址错误: {e}", flush=True)
+        print(f"\n      获取流地址异常: {e}", flush=True)
 
     return None
 
