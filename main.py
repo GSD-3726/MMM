@@ -1,23 +1,3 @@
-#!/usr/bin/env python3
-"""
-iptv-search.com 批量直播源爬虫
-================================
-纯 HTTP 请求，无需浏览器，可在 GitHub Actions 中运行。
-数据源: https://iptv-search.com
-
-用法:
-  python3 main.py                          # 按 demo.txt 爬取
-  python3 main.py -f demo.txt              # 指定频道文件
-  python3 main.py -p 2                     # 每频道取前2页结果
-  python3 main.py -n 5                     # 每频道最多5条
-  python3 main.py -k "CCTV-1"             # 只爬单个频道
-  python3 main.py -p 0 -n 0               # 不限制
-
-参数说明:
-  -p 页数    每频道取几页搜索结果（每页约20条），0=不限制（默认1）
-  -n 条数    每频道最多保留几条流地址，0=不限制（默认3）
-"""
-
 import argparse
 import json
 import os
@@ -39,10 +19,10 @@ BASE_URL = "https://iptv-search.com"
 CHANNEL_FILE = "demo.txt"
 
 # 每频道取几页搜索结果（每页约20条），0 = 不限制
-PAGES = 1
+PAGES = 0
 
 # 每频道最多保留几条流地址，0 = 不限制
-MAX_LINKS = 3
+MAX_LINKS = 30
 
 # 输出文件名前缀
 OUTPUT_NAME = "output"
