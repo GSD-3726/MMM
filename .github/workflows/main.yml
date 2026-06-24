@@ -1,19 +1,14 @@
 name: IPTV 直播源爬取
 
 on:
-  # 手动触发
   workflow_dispatch:
     inputs:
-      pages:
-        description: '每频道爬几页'
-        required: false
-        default: '1'
       max_links:
         description: '每频道最多几条 (0=不限)'
         required: false
         default: '3'
 
-  # 每天北京时间 6:00 和 17:00 自动运行
+  # 每天北京时间 6:00 和 17:00
   schedule:
     - cron: '0 22 * * *'  # UTC 22:00 = 北京 6:00
     - cron: '0 9 * * *'   # UTC 09:00 = 北京 17:00
@@ -21,42 +16,23 @@ on:
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 30
 
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 安装 Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: 安装 agent-browser
-        run: npm install -g agent-browser
-
       - name: 安装 Python 依赖
-        run: pip install beautifulsoup4
+        run: pip install requests beautifulsoup4
 
       - name: 爬取直播源
         env:
-          PAGES: ${{ github.event.inputs.pages || '1' }}
           MAX_LINKS: ${{ github.event.inputs.max_links || '3' }}
         run: |
           python3 main.py \
             -f demo.txt \
-            -p "$PAGES" \
             -n "$MAX_LINKS" \
             -o output
-
-      - name: 上传结果
-        uses: actions/upload-artifact@v4
-        with:
-          name: iptv-result
-          path: |
-            output.txt
-            output.m3u
-          retention-days: 7
 
       - name: 提交结果到仓库
         run: |
