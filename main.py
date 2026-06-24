@@ -124,6 +124,10 @@ def search_channels(keyword, limit=20):
             seen.add(name)
             channels.append({"name": name, "url": url, "category": category})
 
+    print(f"    API 返回: {data.get('numberOfItems', 0)} 条, 去重: {len(channels)} 个", flush=True)
+    if channels:
+        print(f"    频道列表: {[c['name'] for c in channels[:5]]}", flush=True)
+
     return channels
 
 
@@ -223,6 +227,8 @@ def search_single_channel(keyword, pages=1, max_links=0):
 
     exact = [ch for ch in channels if pattern.match(ch["name"])]
     candidates = exact if exact else channels
+
+    print(f"    精确匹配: {len(exact)} 个, 候选: {len(candidates)} 个", flush=True)
 
     results = []
     seen_urls = set()
