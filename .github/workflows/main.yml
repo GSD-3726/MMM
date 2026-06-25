@@ -1,32 +1,32 @@
-name: IPTV 直播源爬取
+name: Update IPTV Sources
+
 on:
-  workflow_dispatch:
   schedule:
-    - cron: '0 22 * * *'  # 北京时间次日 06:00
-    - cron: '0 10 * * *'  # 北京时间当天 18:00
+    - cron: '0 */3 * * *'   # 每3小时运行一次
+  workflow_dispatch:          # 支持手动触发
+
 jobs:
-  crawl:
+  update:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: write
     steps:
-      - name: 检出代码
+      - name: Checkout
         uses: actions/checkout@v4
-      - name: 安装依赖
-        run: |
-          pip install requests beautifulsoup4
-          sudo apt-get update && sudo apt-get install -y ffmpeg
-      - name: 爬取 + 测速
-        run: python3 -u main.py
-      - name: 推送
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests pycryptodome
+
+      - name: Run fetcher
+        run: python migu_iptv_fetcher.py
+
+      - name: Commit and push
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add output/
-          if git diff --staged --quiet; then
-            echo "无变更"
-          else
-            git commit -m "update $(date '+%Y-%m-%d %H:%M')"
-            git push
-          fi
+          git add migu_iptv.txt migu_iptv.m3u
+          timestamp=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M')
+          git diff --cached --quiet || git commit -m "update: ${timestamp}" && git push
