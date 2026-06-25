@@ -18,6 +18,23 @@ import sys
 import gzip
 import base64
 from datetime import datetime
+
+# ============================================================
+# 配置
+# ============================================================
+# 代理（从环境变量读取，格式: http://host:port 或 socks5://host:port）
+HTTPS_PROXY = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or ""
+# Cloudflare Worker 反代地址（解决 GitHub Actions IP 被封问题）
+# 格式: https://your-worker.workers.dev
+MIGU_PROXY = os.environ.get("MIGU_PROXY", "").rstrip("/")
+
+# 全局 session，统一设置代理
+session = requests.Session()
+if HTTPS_PROXY:
+    session.proxies = {"http": HTTPS_PROXY, "https": HTTPS_PROXY}
+    print(f"[*] 使用代理: {HTTPS_PROXY}")
+if MIGU_PROXY:
+    print(f"[*] 使用 Migu 反代: {MIGU_PROXY}")
 from io import BytesIO
 
 try:
@@ -198,10 +215,22 @@ def get_ddcalcu_url(pu_data_url, program_id, client_type, rate_type, user_id="")
 # 咪咕 API
 # ============================================================
 
+def migu_url(url):
+    """如果设置了 MIGU_PROXY，将咪咕 API 请求路由到反代（仅代理 API，不代理流地址）"""
+    if MIGU_PROXY and ("program-sc.miguvideo.com" in url or "play.miguvideo.com" in url):
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+        if "play.miguvideo.com" in url:
+            return f"{MIGU_PROXY}/play{path}"
+        return f"{MIGU_PROXY}/forward{path}"
+    return url
+
+
 def fetch_json(url, headers=None, timeout=TIMEOUT):
     """GET 请求返回 JSON"""
     try:
-        resp = requests.get(url, headers=headers or {}, timeout=timeout, allow_redirects=False)
+        resp = session.get(url, headers=headers or {}, timeout=timeout, allow_redirects=False)
         return resp.json()
     except Exception as e:
         print(f"[!] 请求失败 {url}: {e}")
@@ -211,7 +240,7 @@ def fetch_json(url, headers=None, timeout=TIMEOUT):
 def fetch_redirect(url, headers=None, timeout=TIMEOUT):
     """GET 请求返回 302 Location"""
     try:
-        resp = requests.get(url, headers=headers or {}, timeout=timeout, allow_redirects=False)
+        resp = session.get(url, headers=headers or {}, timeout=timeout, allow_redirects=False)
         return resp.headers.get("Location", "")
     except Exception as e:
         print(f"[!] 请求失败: {e}")
@@ -220,7 +249,7 @@ def fetch_redirect(url, headers=None, timeout=TIMEOUT):
 
 def get_category_list():
     """获取咪咕频道分类列表"""
-    url = "https://program-sc.miguvideo.com/live/v2/tv-data/1ff892f2b5ab4a79be6e25b69d2f5d05"
+    url = migu_url("https://program-sc.miguvideo.com/live/v2/tv-data/1ff892f2b5ab4a79be6e25b69d2f5d05")
     data = fetch_json(url)
     if not data or "body" not in data:
         print("[!] 获取分类列表失败")
@@ -235,7 +264,7 @@ def get_category_list():
 
 def get_channels_by_category(voms_id):
     """获取分类下的频道列表"""
-    url = f"https://program-sc.miguvideo.com/live/v2/tv-data/{voms_id}"
+    url = migu_url(f"https://program-sc.miguvideo.com/live/v2/tv-data/{voms_id}")
     data = fetch_json(url)
     if not data or "body" not in data:
         return []
@@ -269,7 +298,7 @@ def get_migu_play_url_720p(pid):
     hdr_str = "&4kvivid=true&2Kvivid=true&vivid=2" if ENABLE_HDR else ""
     h265_str = "&h265N=true" if ENABLE_H265 else ""
 
-    base_url = "https://play.miguvideo.com/playurl/v1/play/playurl"
+    base_url = migu_url("https://play.miguvideo.com/playurl/v1/play/playurl")
     params = (f"?sign={sign}&rateType={rate_type}&contId={pid}&timestamp={timestamp}"
               f"&salt={salt}&flvEnable=true&super4k=true{h265_str}{hdr_str}")
 
@@ -331,7 +360,7 @@ def get_migu_play_url(pid, user_id="", user_token=""):
     h265_str = "&h265N=true" if ENABLE_H265 else ""
     rate_type = RATE_TYPE
 
-    base_url = "https://play.miguvideo.com/playurl/v1/play/playurl"
+    base_url = migu_url("https://play.miguvideo.com/playurl/v1/play/playurl")
     params = (f"?sign={sign}&rateType={rate_type}&contId={pid}&timestamp={timestamp}"
               f"&salt={salt}&flvEnable=true&super4k=true"
               f"{'&ott=true' if rate_type == 9 else ''}{h265_str}{hdr_str}")
@@ -384,7 +413,7 @@ def fetch_fengcaizb():
     url = "http://pro.fengcaizb.com/channels/pro.gz"
     headers = {"Referer": "http://pro.fengcaizb.com"}
     try:
-        resp = requests.get(url, headers=headers, timeout=15)
+        resp = session.get(url, headers=headers, timeout=15)
         if resp.status_code != 200:
             print(f"[!] fengcaizb 请求失败: {resp.status_code}")
             return []
