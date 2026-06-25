@@ -21,7 +21,7 @@ jobs:
         run: pip install requests pycryptodome
 
       - name: Run fetcher
-        run: python migu_iptv_fetcher.py
+        run: python main.py
 
       - name: Commit and push
         run: |
