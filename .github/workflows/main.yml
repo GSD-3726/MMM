@@ -2,8 +2,8 @@ name: Update IPTV Sources
 
 on:
   schedule:
-    - cron: '0 */3 * * *'   # 每3小时运行一次
-  workflow_dispatch:          # 支持手动触发
+    - cron: '0 */3 * * *'
+  workflow_dispatch:
 
 jobs:
   update:
@@ -21,6 +21,8 @@ jobs:
         run: pip install requests pycryptodome
 
       - name: Run fetcher
+        env:
+          MIGU_PROXY: ${{ secrets.MIGU_PROXY }}
         run: python main.py
 
       - name: Commit and push
