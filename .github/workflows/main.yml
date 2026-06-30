@@ -1,7 +1,7 @@
 name: Update IPTV Sources
 
 on:
-  #schedule:
+  schedule:
     - cron: '0 */3 * * *'
   workflow_dispatch:
 
